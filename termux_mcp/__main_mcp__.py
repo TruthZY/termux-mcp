@@ -11,6 +11,7 @@ import argparse
 import logging
 import sys
 import threading
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,39 +44,49 @@ def main():
             from . import config
             config.HOST = args.api_host
 
-        # Start original server in background thread
-        from . import server as original_server
-        api_thread = threading.Thread(
-            target=original_server.run,
-            daemon=True,
-            name="termux-api-server",
-        )
-        api_thread.start()
-
         from .config import HOST, PORT
-        logger.info(f"Original API server starting on http://{HOST}:{PORT}")
 
-        # Update bridge config
+        # ── Step 1: Start MCP bridge in a background thread ──
         from . import mcp_bridge
         mcp_bridge.MCP_HOST = args.mcp_host
         mcp_bridge.MCP_PORT = args.mcp_port
         mcp_bridge.INTERNAL_HOST = HOST
         mcp_bridge.INTERNAL_PORT = PORT
 
-        # Start MCP bridge on main thread
-        logger.info(f"MCP Bridge starting on http://{args.mcp_host}:{args.mcp_port}/mcp")
-        logger.info("")
-        logger.info("╔══════════════════════════════════════════════════╗")
-        logger.info("║       Termux MCP Server + Bridge v0.7.3          ║")
-        logger.info("╠══════════════════════════════════════════════════╣")
-        logger.info(f"║  REST API:  http://{HOST}:{PORT}          ║")
-        logger.info(f"║  MCP:       http://{args.mcp_host}:{args.mcp_port}/mcp     ║")
-        logger.info("║  Health:    http://{}:{}/health      ║".format(args.mcp_host, args.mcp_port))
-        logger.info("╚══════════════════════════════════════════════════╝")
-        logger.info("")
+        mcp_error = [None]  # use list so inner function can write to it
 
+        def run_mcp():
+            try:
+                mcp_bridge.run_mcp_server(args.mcp_host, args.mcp_port)
+            except Exception as e:
+                mcp_error[0] = e
+
+        mcp_thread = threading.Thread(target=run_mcp, daemon=True, name="mcp-bridge")
+        mcp_thread.start()
+
+        # Give MCP bridge a moment to bind its port
+        time.sleep(0.5)
+
+        if mcp_error[0] is not None:
+            logger.error(f"MCP Bridge failed to start: {mcp_error[0]}")
+            sys.exit(1)
+
+        # ── Step 2: Print banner ──
+        print("")
+        print("=" * 54)
+        print("       Termux MCP Server + Bridge v0.7.3")
+        print("=" * 54)
+        print(f"  REST API:  http://{HOST}:{PORT}")
+        print(f"  MCP:       http://{args.mcp_host}:{args.mcp_port}/mcp")
+        print(f"  Health:    http://{args.mcp_host}:{args.mcp_port}/health")
+        print("=" * 54)
+        print("")
+        sys.stdout.flush()
+
+        # ── Step 3: Start original REST server on main thread ──
+        from . import server as original_server
         try:
-            mcp_bridge.run_mcp_server(args.mcp_host, args.mcp_port)
+            original_server.run()
         except KeyboardInterrupt:
             logger.info("Shutting down...")
             sys.exit(0)
