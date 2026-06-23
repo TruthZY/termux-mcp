@@ -1,226 +1,217 @@
 # Termux-MCP
 
-A lightweight HTTP server that runs inside Termux on Android, exposing shell execution and device capabilities as a streaming API. Built for AI agents, LLM tool-calling, and automation scripts.
+A standalone MCP (Model Context Protocol) server for Termux on Android. Exposes 88+ tools covering shell execution, file operations, device control, media, and developer utilities via the standard MCP Streamable HTTP protocol. Designed for AI agents like MiClaw, Claude Desktop, Cursor, and any MCP-compatible client.
 
 ```text
-AI Agent --> POST /run {"cmd": "ls -la"} --> Termux-MCP --> Termux Shell
-                                                  |
-                      <-- chunked streaming output -+
+MCP Client ──JSON-RPC 2.0──> POST /mcp ──> Termux-MCP ──> Tool Handler
+  (MiClaw, Claude, etc.)       <── result ──     │
+                                                  ├── shell_exec()
+                                                  ├── file_read()
+                                                  ├── battery_status()
+                                                  └── ...88 tools
 ```
 
-## Installation
+## Architecture
+
+```
+termux_mcp/
+├── __main__.py          # Entry point (argparse + handler import)
+├── mcp_server.py        # MCP Streamable HTTP server (JSON-RPC 2.0)
+├── registry.py          # Central tool registry (@register_tool decorator)
+├── config.py            # Environment-based configuration
+├── shell.py             # Shell execution engine (streaming output)
+├── utils.py             # Path safety, shell quoting, JSON helpers
+└── handlers/
+    ├── basic.py         # Shell, file, system basics
+    ├── device.py        # Device, sensors, communication, media
+    ├── tools.py         # Dev tools, git, diagnostics, utilities
+    ├── ai_power.py      # AI-enhanced power features
+    ├── terminal.py      # Terminal power-tools
+    ├── features.py      # System, cron, backup, recipes
+    └── history.py       # Command history
+```
+
+Tools are registered via the `@register_tool` decorator in each handler module. The registry auto-generates both MCP and OpenAI function-calling schemas from a single source of truth. No external dependencies — pure Python standard library.
+
+## Quick Start
 
 ```bash
-pkg update && pkg install python git -y
-git clone https://github.com/termuxgpt/termux-mcp
+# One-time setup
+pkg install python git -y
+git clone -b main https://github.com/TruthZY/termux-mcp.git
 cd termux-mcp
-python -m termux_mcp
+chmod +x start-mcp.sh
+./start-mcp.sh
 ```
 
-Or via the package repository:
+After the first run, just type `mcp` in any Termux session to start the server.
+
+## Manual Start
 
 ```bash
-curl -fSL https://termux-mcp.pages.dev/add-repo.sh | bash
-pkg install termux-mcp
-termux-mcp
-```
-
-## Quick Test
-
-```bash
-curl http://localhost:8080/ping
-curl -X POST http://localhost:8080/run -H "Content-Type: application/json" -d '{"cmd": "ls ~"}'
+cd ~/termux-mcp
+python -m termux_mcp                    # Default: port 3000, bind 0.0.0.0
+python -m termux_mcp --port 3000        # Custom port
+python -m termux_mcp --host 127.0.0.1   # Local-only binding
 ```
 
 ## Configuration
 
 | Variable | Default | Description |
-|---|---|---|
-| `TERMUX_MCP_PORT` | `8080` | HTTP listen port |
-| `TERMUX_MCP_HOST` | `127.0.0.1` | Bind address. Use `127.0.0.1` for local-only. |
-| `TERMUX_MCP_TIMEOUT` | `120` | Command timeout in seconds |
-| `TERMUX_MCP_AUTH_TOKEN` | (none) | Bearer token for authentication |
+|----------|---------|-------------|
+| `TERMUX_MCP_PORT` | `3000` | MCP server listen port |
+| `TERMUX_MCP_HOST` | `0.0.0.0` | Bind address |
+| `TERMUX_MCP_TIMEOUT` | `120` | Shell command timeout (seconds) |
+| `TERMUX_MCP_AUTH_TOKEN` | *(none)* | API key for authentication |
 
-Set `TERMUX_MCP_AUTH_TOKEN` to a value 16+ characters long to require authentication on all endpoints. When binding to a non-loopback address, authentication is mandatory.
+Set `TERMUX_MCP_AUTH_TOKEN` (16+ characters) to require `X-API-Key` or `Authorization: Bearer` authentication on all requests.
 
-## Endpoints
+## MCP Protocol
 
-### Shell & Filesystem
+The server implements the [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP:
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/run` | POST | `cmd` (string, required) | Execute a shell command with streaming output. Maintains persistent `cd` state across requests. |
-| `/ls` | POST | `path` (string, default `.`), `detailed` (bool) | List directory contents |
-| `/read` | POST | `path` (string, required) | Read a file (first 500 lines) |
-| `/write` | POST | `path`, `content` | Write content to a file via base64 encoding |
-| `/mkdir` | POST | `path` | Create directory (`mkdir -p`) |
-| `/delete` | POST | `path`, `recursive` (bool), `confirmed` (bool) | Delete file or directory. Requires confirmation. |
-| `/search` | POST | `path`, `pattern` (or `query`/`name`) | Find files by name pattern |
-| `/cancel` | POST | | Cancel currently running command |
+- **Endpoint**: `POST /mcp`
+- **Protocol**: JSON-RPC 2.0
+- **Methods**: `initialize`, `tools/list`, `tools/call`, `notifications/initialized`
+- **Health check**: `GET /health`
 
-### System Monitor & Management
+### MiClaw Configuration
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/system-info` | POST | | Live CPU%, RAM, disk, temperature, uptime as JSON |
-| `/process-list` | POST | `limit` (int, default 20) | List running processes sorted by CPU usage |
-| `/process-kill` | POST | `pid` (int), `signal` (int, default 15) | Terminate a process by PID |
-| `/health` | POST | | Full diagnostic: core packages, Termux:API, storage, network, permissions |
+```json
+{
+  "mcpServers": {
+    "termux-mcp": {
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
 
-### Cron Scheduler
+### Claude Desktop / Cursor
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/cron-add` | POST | `schedule`, `command`, `label` | Add a cron job. Schedule format: `0 3 * * *` for daily at 3am. |
-| `/cron-list` | POST | | List all cron jobs |
-| `/cron-remove` | POST | `label` (optional) | Remove cron jobs matching a label, or all if no label given |
+```json
+{
+  "mcpServers": {
+    "termux-mcp": {
+      "url": "http://<phone-ip>:3000/mcp"
+    }
+  }
+}
+```
 
-### Backup, Restore & Cloud Sync
+## Tools (88+)
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/backup` | POST | `target` (home/packages/configs), `output`, `include` | Create a tar.gz backup of home, packages, or configs |
-| `/restore` | POST | `file`, `target` | Restore from a backup file |
-| `/cloud-sync` | POST | `action` (backup/restore/list), `target`, `output`, `file` | Create backups and provide cloud upload instructions |
+### Shell & File
 
-### Code & Files
-
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/diff` | POST | `file`, `file2` (optional) | Show diff between files, or file stats for a single file |
-| `/patch` | POST | `file`, `patch` | Apply a diff patch to a file |
+| Tool | Description |
+|------|-------------|
+| `shell_exec` | Execute shell command, streaming output |
+| `shell_cancel` | Cancel running command |
+| `file_list` | List directory contents |
+| `file_read` | Read file (first 500 lines) |
+| `file_write` | Write/create file |
+| `file_mkdir` | Create directory (recursive) |
+| `file_delete` | Delete file/directory (with confirmation) |
+| `file_search` | Search files by pattern |
 
 ### Device & Sensors
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/battery` | POST | | Battery status via `termux-battery-status` |
-| `/location` | POST | `provider` (gps/network, default gps) | GPS coordinates via `termux-location` |
-| `/wifi-info` | POST | | WiFi connection details |
-| `/wifi-scan` | POST | | Scan nearby WiFi networks |
-| `/camera-photo` | POST | `camera_id` (0/1), `output` | Take a photo |
-| `/camera-info` | POST | | List available cameras |
-| `/screenshot` | POST | `output` | Take a screenshot |
-| `/sensor` | POST | `sensor`, `limit` | Read sensor data |
-| `/fingerprint` | POST | | Fingerprint authentication |
-| `/vibrate` | POST | `duration_ms` | Vibrate the device |
-| `/torch` | POST | `state` (on/off) | Toggle flashlight |
-| `/brightness` | POST | `level` | Get/set screen brightness |
-| `/volume` | POST | `stream`, `level` | Get/set volume |
+| Tool | Description |
+|------|-------------|
+| `battery_status` | Battery level, charging, temperature |
+| `vibrate` | Trigger haptic vibration |
+| `torch` | Toggle flashlight |
+| `wallpaper` | Set device wallpaper |
+| `brightness` | Get/set screen brightness (0-255) |
+| `volume` | Get/set audio stream volume |
+| `sensor_read` | Read accelerometer, gyroscope, etc. |
+| `fingerprint` | Fingerprint authentication |
+| `infrared` | Transmit IR signal |
+
+### Network & Location
+
+| Tool | Description |
+|------|-------------|
+| `wifi_info` | Current WiFi connection details |
+| `wifi_scan` | Scan nearby WiFi networks |
+| `location` | GPS/network location |
+| `public_ip` | Public IP address |
 
 ### Communication
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/notify` | POST | `title`, `content`, `priority`, `id` | Send an Android notification |
-| `/notify-remove` | POST | `id` | Remove a notification |
-| `/sms-send` | POST | `number`, `text` | Send an SMS |
-| `/sms-inbox` | POST | `limit` | Read SMS inbox |
-| `/tts-speak` | POST | `text`, `rate`, `pitch` | Text-to-speech |
-| `/speech-to-text` | POST | | Speech recognition |
-| `/toast` | POST | `text` | Show an Android toast |
-| `/dialog` | POST | `title`, `message` | Show a confirmation dialog |
-| `/share` | POST | `text` or `file` | Share via Android intent |
-| `/clipboard-get` | POST | | Read clipboard |
-| `/clipboard-set` | POST | `text` | Set clipboard |
-| `/call` | POST | `number` | Initiate a phone call |
-| `/contacts` | POST | | List contacts |
-| `/list-apps` | POST | | List installed apps |
+| Tool | Description |
+|------|-------------|
+| `clipboard_get` / `clipboard_set` | Read/write system clipboard |
+| `sms_send` / `sms_inbox` | Send/read SMS |
+| `contacts` | List address book |
+| `phone_call` | Dial a number |
+| `notify` / `notify_remove` | System notifications |
+| `share` | Android share sheet |
+| `open_url` | Open URL in browser |
 
-### Network
+### Media & Camera
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/open-url` | POST | `url` | Open URL in browser |
-| `/download` | POST | `url`, `description`, `title` | Download a file |
-| `/public-ip` | POST | | Get public IP address |
-| `/weather` | POST | `city` | Weather via wttr.in |
-| `/speedtest` | POST | | Internet speed test |
-| `/web-server` | POST | `action` (start/stop/status), `port`, `directory` | Start a Python HTTP server |
+| Tool | Description |
+|------|-------------|
+| `camera_photo` / `camera_info` | Take photo / list cameras |
+| `screenshot` | Capture screen |
+| `screen_record` | Start/stop screen recording |
+| `tts_speak` | Text-to-speech |
+| `speech_to_text` | Voice recognition |
+| `microphone_record` | Record audio |
+| `media_player` | Playback control |
+| `qrcode` / `scan_barcode` | Generate/scan QR codes |
 
-### Media
+### System & Process
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/image-process` | POST | `action`, `input`, `output`, `width`, `height` | Image operations via ImageMagick |
-| `/video-process` | POST | `action`, `input`, `output`, `crf`, `start`, `duration` | Video operations via FFmpeg |
-| `/text-extract` | POST | `input`, `lang` | OCR via Tesseract |
-| `/qrcode` | POST | `text`, `output` | Generate QR code |
-| `/scan-barcode` | POST | `camera_id`, `output` | Scan barcode via camera |
-| `/screen-record` | POST | `output`, `action` (start/stop) | Screen recording |
-| `/microphone-record` | POST | `output`, `limit_seconds`, `action` | Microphone recording |
-| `/wallpaper` | POST | `file`, `lockscreen` | Set wallpaper |
+| Tool | Description |
+|------|-------------|
+| `system_info` | CPU, RAM, disk, temperature, uptime |
+| `process_list` / `process_kill` | Process management |
+| `health` | Full system diagnostic |
+| `env` / `ping` | Environment info / health check |
 
-### Smart Tools
+### Developer Tools
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/smart-install` | POST | `packages`, `manager`, `dry_run` | Intelligent package install with conflict detection |
-| `/diagnose` | POST | `intent` (python/pip/node/git/storage/packages/all) | Run diagnostics for a specific tool |
-| `/pkg-smart` | POST | `intent`, `install` | Intent-based package discovery (60+ mappings) |
-| `/dev-env` | POST | `intent`, `name` | One-click development environment setup |
-| `/profile` | POST | `profile`, `dry_run` | Pre-configured Termux profiles (dev, python, web, hacker, etc.) |
-| `/optimize` | POST | | Performance analysis and recommendations |
-| `/error-explain` | POST | `error`, `command` | Gather context to help AI explain errors |
-| `/permission-fix` | POST | `target` | Diagnose and fix permission issues |
-| `/storage-audit` | POST | | Find large files and suggest cleanup |
-| `/deps-tree` | POST | `package` | Show package dependency tree |
-| `/config-fix` | POST | `config` | Check Termux configuration issues |
-| `/review` | POST | `file` | Static analysis (syntax check, linting) |
-| `/log-analyze` | POST | `file` | Extract errors and warnings from log files |
-| `/script-gen` | POST | `description`, `type`, `output` | Generate shell or Python script templates |
-| `/regex` | POST | `pattern`, `test` | Test regex patterns with grep |
-| `/db-design` | POST | `schema`, `output` | Create SQLite database from schema description |
-| `/db-query` | POST | `database`, `query` | Execute SQLite query |
-| `/translate` | POST | `text`, `target_lang`, `source_lang` | Text translation |
-| `/tutorial` | POST | `topic` | Interactive Termux learning guide |
+| Tool | Description |
+|------|-------------|
+| `git_op` | Git clone/status/log/diff/pull/push |
+| `git_smart` | AI-friendly git (suggest commit, fix conflict) |
+| `git_pr` | GitHub PR management |
+| `review` | Code review (syntax check, lint) |
+| `script_gen` | Generate shell/Python scripts |
+| `regex_test` | Test regex patterns |
+| `db_query` / `db_design` | SQLite queries / schema design |
+| `explain` | Explain shell commands |
+| `dev_env` | One-click dev environment setup |
 
-### Git Operations
+### Utilities
 
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/git-op` | POST | `action` (clone/status/log/diff/pull/push/branch), `url`, `directory`, `repo_dir` | General git operations |
-| `/git-smart` | POST | `action` (diff-summary/log-recent/suggest-commit/fix-conflict), `repo_dir` | AI-friendly smart git operations |
-
-### SSH, Services & Migration
-
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/ssh-wizard` | POST | `action` (setup/status/stop) | Full SSH server setup with key generation |
-| `/service-guard` | POST | `action`, `name`, `cmd` | Background service management |
-| `/history-insight` | POST | `file`, `limit` | Analyze shell usage patterns, suggest aliases |
-| `/quick-cmd` | POST | `action`, `name`, `cmd` | Alias and shortcut management |
-| `/port-manage` | POST | `action`, `port` | Network port visibility |
-| `/migrate` | POST | `action` (backup/restore/preview), `output`, `file` | Full Termux environment migration |
-
-### Other
-
-| Endpoint | Method | Parameters | Description |
-|---|---|---|---|
-| `/ping` | GET | | Health check |
-| `/env` | GET | | Environment info (cwd, home, pid) |
-| `/explain` | POST | `cmd` | Explain what a shell command does |
-| `/telephony-deviceinfo` | POST | | Device telephony info |
-| `/telephony-cellinfo` | POST | | Cell tower info |
-| `/infrared` | POST | `frequency`, `pattern` | IR blaster |
-| `/media-player` | POST | `action` | Media playback control |
-| `/storage-get` | POST | `output` | Get file via Android SAF |
-
-## Streaming Output
-
-The `/run` endpoint and most tool endpoints use HTTP chunked transfer encoding. Output is sent line-by-line as the command produces it. Clients should read the response as a stream and process each chunk as it arrives.
-
-For long-running commands, a watchdog thread enforces the timeout. Package install commands automatically receive `-y` flags and `DEBIAN_FRONTEND=noninteractive` to prevent prompts.
+| Tool | Description |
+|------|-------------|
+| `image_process` | Image operations (requires ImageMagick) |
+| `video_process` | Video operations (requires FFmpeg) |
+| `text_extract` | OCR text extraction (requires Tesseract) |
+| `translate` | Text translation |
+| `weather` | Weather query |
+| `speedtest` | Network speed test |
+| `download` | Download via system manager |
+| `web_server` | Start/stop HTTP file server |
+| `smart_install` | Smart package installation |
+| `diagnose` | Environment diagnostics |
+| `ssh_wizard` | SSH server setup |
+| `backup` / `restore` | Backup and restore |
+| `migrate` | Environment migration |
+| `cron_add` / `cron_list` / `cron_remove` | Scheduled tasks |
+| `recipe_save` / `recipe_run` | Automation recipes |
 
 ## Security
 
-- All commands are checked against a risk assessment system. Dangerous patterns (like `rm -rf /` or writes to `/dev/`) are blocked.
-- Paths targeting `/dev/`, `/proc/`, or `/sys/` are rejected with canonical path resolution.
-- Numeric parameters are validated before shell interpolation to prevent injection.
-- When `TERMUX_MCP_AUTH_TOKEN` is set, all POST endpoints require a Bearer token.
-- Non-loopback binding enforces mandatory authentication.
-- Request body size is capped at 5 MB.
-
+- Shell commands checked against risk patterns (fork bombs, `rm -rf /`, etc.)
+- File paths validated against `/dev/`, `/proc/`, `/sys/` access
+- API key authentication supported via `X-API-Key` or `Authorization: Bearer`
+- Request body capped at 5 MB
+- Dangerous operations require explicit confirmation
 
 ## License
 
