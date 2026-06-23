@@ -12,4 +12,4 @@ authors = [{name = "Parixit Sutariya"}]
 requires-python = ">=3.8"
 
 [project.scripts]
-termux-mcp = "termux_mcp.__main__:run"
+termux-mcp = "termux_mcp.__main_mcp__:main"
