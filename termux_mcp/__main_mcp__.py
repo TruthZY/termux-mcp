@@ -36,64 +36,120 @@ def main():
     args = parser.parse_args()
 
     if args.mcp:
-        # Override config if specified
-        if args.api_port:
-            from . import config
-            config.PORT = args.api_port
-        if args.api_host:
-            from . import config
-            config.HOST = args.api_host
-
-        from .config import HOST, PORT
-
-        # ── Step 1: Start MCP bridge in a background thread ──
-        from . import mcp_bridge
-        mcp_bridge.MCP_HOST = args.mcp_host
-        mcp_bridge.MCP_PORT = args.mcp_port
-        mcp_bridge.INTERNAL_HOST = HOST
-        mcp_bridge.INTERNAL_PORT = PORT
-
-        mcp_error = [None]  # use list so inner function can write to it
-
-        def run_mcp():
-            try:
-                mcp_bridge.run_mcp_server(args.mcp_host, args.mcp_port)
-            except Exception as e:
-                mcp_error[0] = e
-
-        mcp_thread = threading.Thread(target=run_mcp, daemon=True, name="mcp-bridge")
-        mcp_thread.start()
-
-        # Give MCP bridge a moment to bind its port
-        time.sleep(0.5)
-
-        if mcp_error[0] is not None:
-            logger.error(f"MCP Bridge failed to start: {mcp_error[0]}")
-            sys.exit(1)
-
-        # ── Step 2: Print banner ──
-        print("")
-        print("=" * 54)
-        print("       Termux MCP Server + Bridge v0.7.3")
-        print("=" * 54)
-        print(f"  REST API:  http://{HOST}:{PORT}")
-        print(f"  MCP:       http://{args.mcp_host}:{args.mcp_port}/mcp")
-        print(f"  Health:    http://{args.mcp_host}:{args.mcp_port}/health")
-        print("=" * 54)
-        print("")
-        sys.stdout.flush()
-
-        # ── Step 3: Start original REST server on main thread ──
-        from . import server as original_server
-        try:
-            original_server.run()
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            sys.exit(0)
+        _run_with_mcp(args)
     else:
-        # Original mode: just run the REST server
         from . import server
         server.run()
+
+
+def _run_with_mcp(args):
+    """Run both REST API server and MCP bridge simultaneously."""
+    from .config import HOST, PORT, AUTH_TOKEN, REQUIRE_AUTH
+    from .handler import MCPHandler
+    from .network import kill_port
+    from .shell import get_current_dir
+    from .mcp_bridge import MCPBridgeHandler, ThreadingMCPServer
+
+    # Override config if specified
+    if args.api_port:
+        from . import config
+        config.PORT = args.api_port
+        import importlib
+        importlib.reload(config)
+        from .config import PORT
+    if args.api_host:
+        from . import config
+        config.HOST = args.api_host
+        import importlib
+        importlib.reload(config)
+        from .config import HOST
+
+    # ── Auth checks ──
+    if REQUIRE_AUTH:
+        if len(AUTH_TOKEN) < 16:
+            logger.error("TERMUX_MCP_AUTH_TOKEN too short (< 16 chars).")
+            sys.exit(1)
+        logger.info("Auth token configured (length=%d)", len(AUTH_TOKEN))
+
+    if HOST not in ("127.0.0.1", "localhost") and not REQUIRE_AUTH:
+        logger.error("HOST=%s is non-loopback but no auth token set.", HOST)
+        sys.exit(1)
+
+    # ── Free ports ──
+    logger.info("Freeing port %d (REST)...", PORT)
+    kill_port(PORT)
+    logger.info("Freeing port %d (MCP)...", args.mcp_port)
+    kill_port(args.mcp_port)
+
+    # ── Create both servers ──
+    from http.server import HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class RestServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    rest_server = RestServer((HOST, PORT), MCPHandler)
+    mcp_server = ThreadingMCPServer((args.mcp_host, args.mcp_port), MCPBridgeHandler)
+
+    # Update bridge internal target
+    from . import mcp_bridge
+    mcp_bridge.INTERNAL_HOST = HOST
+    mcp_bridge.INTERNAL_PORT = PORT
+
+    # ── Start both in daemon threads ──
+    errors = []
+
+    def run_rest():
+        try:
+            rest_server.serve_forever()
+        except Exception as e:
+            errors.append(f"REST server error: {e}")
+
+    def run_mcp():
+        try:
+            mcp_server.serve_forever()
+        except Exception as e:
+            errors.append(f"MCP bridge error: {e}")
+
+    t_rest = threading.Thread(target=run_rest, daemon=True, name="rest-server")
+    t_mcp = threading.Thread(target=run_mcp, daemon=True, name="mcp-bridge")
+
+    t_rest.start()
+    t_mcp.start()
+
+    # Give both a moment to bind
+    time.sleep(0.3)
+
+    if errors:
+        for err in errors:
+            logger.error(err)
+        sys.exit(1)
+
+    # ── Banner ──
+    print("", flush=True)
+    print("=" * 56, flush=True)
+    print("       Termux MCP Server + Bridge v0.7.3", flush=True)
+    print("=" * 56, flush=True)
+    print(f"  REST API:  http://{HOST}:{PORT}", flush=True)
+    print(f"  MCP:       http://{args.mcp_host}:{args.mcp_port}/mcp", flush=True)
+    print(f"  Health:    http://{args.mcp_host}:{args.mcp_port}/health", flush=True)
+    print(f"  Work dir:  {get_current_dir()}", flush=True)
+    print("=" * 56, flush=True)
+    print("  Press Ctrl+C to stop", flush=True)
+    print("", flush=True)
+
+    logger.info("REST API running on http://%s:%d", HOST, PORT)
+    logger.info("MCP Bridge running on http://%s:%d/mcp", args.mcp_host, args.mcp_port)
+
+    # ── Block main thread ──
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        rest_server.shutdown()
+        mcp_server.shutdown()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
