@@ -1,3 +1,4 @@
+import io
 import os
 import signal
 import subprocess
@@ -92,6 +93,97 @@ def handle_cd(raw_cmd: str) -> tuple:
         return True, get_current_dir()
 
     return False, f"Directory not found: {new_path}"
+
+
+def execute(raw_cmd: str) -> str:
+    """
+    Execute a shell command and return the full output as a string.
+    Used by MCP handlers (non-streaming).
+    """
+    raw_cmd = raw_cmd.strip()
+    if not raw_cmd:
+        return ""
+
+    # Handle cd specially
+    if raw_cmd.startswith("cd"):
+        ok, msg = handle_cd(raw_cmd)
+        rest = raw_cmd[2:].strip()
+        for sep in (";", "&&"):
+            idx = rest.find(sep)
+            if idx != -1:
+                chained = rest[idx + len(sep):].strip()
+                if chained and ok:
+                    return msg + "\n" + _run_process_collect(chained)
+                break
+        return msg + "\n"
+
+    return _run_process_collect(raw_cmd)
+
+
+def _run_process_collect(raw_cmd: str) -> str:
+    """Run a command and collect all output into a string."""
+    tld = _get_tld()
+    cmd = preprocess(raw_cmd)
+    output_buf = io.StringIO()
+    process = None
+    killed = threading.Event()
+
+    try:
+        popen_kwargs = {
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.PIPE,
+            "text": True,
+            "cwd": tld.current_dir,
+        }
+        if hasattr(os, "setsid"):
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        process = subprocess.Popen(f"export PAGER=cat; {cmd}", **popen_kwargs)
+
+        with tld.pid_lock:
+            tld.active_pid = process.pid
+
+        _spawn_auto_input(process, raw_cmd)
+
+        def _timeout_watchdog() -> None:
+            try:
+                process.wait(timeout=COMMAND_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                killed.set()
+                try:
+                    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        time.sleep(1)
+                    process.kill()
+                except Exception:
+                    process.kill()
+
+        watchdog = threading.Thread(target=_timeout_watchdog, daemon=True)
+        watchdog.start()
+
+        for line in process.stdout:
+            output_buf.write(line)
+            if killed.is_set():
+                output_buf.write(f"\n⏱️ Timed out after {COMMAND_TIMEOUT}s\n")
+                break
+
+        watchdog.join(timeout=2)
+
+        if not killed.is_set():
+            if process.returncode and process.returncode != 0:
+                output_buf.write(f"\n❌ Exit code: {process.returncode}\n")
+            else:
+                output_buf.write("\n✅ Done\n")
+
+    except Exception as e:
+        output_buf.write(f"\n❌ Error: {e}\n")
+    finally:
+        with tld.pid_lock:
+            tld.active_pid = None
+
+    return output_buf.getvalue()
 
 
 def _send_chunk(handler: "BaseHTTPRequestHandler", text: str) -> None:

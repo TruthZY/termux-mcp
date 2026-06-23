@@ -1,12 +1,11 @@
+"""History tools: list, save, and clear command execution history."""
+
 import json
 import os
 import time
-from typing import TYPE_CHECKING
 
-from ..utils import json_response
-
-if TYPE_CHECKING:
-    from http.server import BaseHTTPRequestHandler
+from ..registry import register_tool
+from ..utils import error_msg, json_result
 
 HISTORY_FILE = os.path.join(
     os.environ.get("HOME", "/data/data/com.termux/files/home"),
@@ -25,24 +24,41 @@ def _load() -> list:
 
 
 def _save(entries: list) -> None:
-    # Trim to max entries
     if len(entries) > MAX_ENTRIES:
         entries = entries[-MAX_ENTRIES:]
     with open(HISTORY_FILE, "w") as f:
         json.dump(entries, f)
 
 
-def handle_history_list(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+@register_tool(
+    name="history_list",
+    description="List command execution history.",
+    schema={"type": "object", "properties": {}},
+    category="history",
+)
+def handle_history_list(data: dict) -> str:
     entries = _load()
-    json_response(handler, 200, {"entries": entries, "count": len(entries)})
+    return json_result({"entries": entries, "count": len(entries)})
 
 
-def handle_history_save(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="history_save",
+    description="Save a command execution record to history.",
+    schema={
+        "type": "object",
+        "properties": {
+            "raw_input": {"type": "string", "description": "Command that was run"},
+            "output": {"type": "string", "description": "Command output"},
+            "success": {"type": "boolean", "description": "Whether the command succeeded"},
+        },
+    },
+    category="history",
+)
+def handle_history_save(data: dict) -> str:
     raw_input = (data.get("rawInput") or data.get("raw_input") or "").strip()
     output = (data.get("output") or "").strip()
     if not raw_input and not output:
-        json_response(handler, 400, {"error": "Missing rawInput or output"})
-        return
+        return error_msg("Missing rawInput or output")
 
     entries = _load()
     ran_cmd = (data.get("ranCommand") or "").strip()
@@ -56,14 +72,25 @@ def handle_history_save(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     }
     entries.append(entry)
     _save(entries)
-    json_response(handler, 200, {"saved": True, "total": len(entries)})
+    return json_result({"saved": True, "total": len(entries)})
 
 
-def handle_history_clear(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+@register_tool(
+    name="history_clear",
+    description="Clear all command execution history.",
+    schema={"type": "object", "properties": {}},
+    category="history",
+)
+def handle_history_clear(data: dict) -> str:
     try:
         os.remove(HISTORY_FILE)
-        json_response(handler, 200, {"cleared": True})
+        return json_result({"cleared": True})
     except FileNotFoundError:
-        json_response(handler, 200, {"cleared": True})
+        return json_result({"cleared": True})
     except Exception as e:
-        json_response(handler, 500, {"error": str(e)})
+        return error_msg(str(e))
+import json
+import os
+import time
+from typing import TYPE_CHECKING
+

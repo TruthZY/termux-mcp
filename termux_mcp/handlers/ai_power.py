@@ -1,24 +1,35 @@
+"""AI-powered tools: smart install, profiles, SSH wizard, migration, etc."""
+
 import os
-from typing import TYPE_CHECKING
 
-from ..shell import execute_streaming, get_current_dir
-from ..utils import json_response, shell_quote
-
-if TYPE_CHECKING:
-    from http.server import BaseHTTPRequestHandler
+from ..registry import register_tool
+from ..shell import execute, get_current_dir
+from ..utils import error_msg, shell_quote
 
 HOME = os.environ.get("HOME", "/data/data/com.termux/files/home")
 
 
-
-def handle_smart_install(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="smart_install",
+    description="Intelligently install packages with auto-detection of package manager.",
+    schema={
+        "type": "object",
+        "properties": {
+            "packages": {"type": "string", "description": "Packages to install (space or comma separated)"},
+            "manager": {"type": "string", "enum": ["auto", "pkg", "pip", "npm"], "description": "Package manager (default: auto)"},
+            "dry_run": {"type": "boolean", "description": "Preview without installing"},
+        },
+        "required": ["packages"],
+    },
+    category="ai_power",
+)
+def handle_smart_install(data: dict) -> str:
     packages = data.get("packages", "").strip()
-    manager = data.get("manager", "auto").strip()  # auto, pkg, pip, npm, gem, cargo
+    manager = data.get("manager", "auto").strip()
     dry_run = data.get("dry_run", False)
 
     if not packages:
-        _json_response(handler, 400, {"error": "Missing 'packages' — space-separated list"})
-        return
+        return error_msg("Missing 'packages' — space-separated list")
 
     checks = [
         'echo "=== Pre-Install Check ==="',
@@ -60,11 +71,21 @@ def handle_smart_install(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             checks.append(f'pip install {packages} 2>&1 | tail -15')
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_permission_fix(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="permission_fix",
+    description="Diagnose and fix common permission issues.",
+    schema={
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "enum": ["storage", "files", "api", "network", "termux", "all"], "description": "Permission area to fix"},
+        },
+    },
+    category="ai_power",
+)
+def handle_permission_fix(data: dict) -> str:
     target = data.get("target", "all").strip()
 
     checks = ['echo "=== Permission Diagnostic ==="']
@@ -108,11 +129,22 @@ def handle_permission_fix(handler: "BaseHTTPRequestHandler", data: dict) -> None
         ]
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="profile",
+    description="Apply a Termux profile preset (dev, python, web, hacker, writer, minimal).",
+    schema={
+        "type": "object",
+        "properties": {
+            "profile": {"type": "string", "enum": ["dev", "python", "web", "hacker", "writer", "minimal"], "description": "Profile to apply"},
+            "dry_run": {"type": "boolean", "description": "Preview changes without applying"},
+        },
+    },
+    category="ai_power",
+)
+def handle_profile(data: dict) -> str:
     profile = data.get("profile", "dev").strip()
     dry_run = data.get("dry_run", False)
 
@@ -135,9 +167,9 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             "pip": "ipython requests flask django pytest black mypy",
             "setup": [
                 "echo 'alias py=python3' >> ~/.bashrc",
-                "echo 'alias venv=\"python3 -m venv .venv && source .venv/bin/activate\"' >> ~/.bashrc",
+                'echo \'alias venv="python3 -m venv .venv && source .venv/bin/activate"\' >> ~/.bashrc',
                 "mkdir -p ~/projects ~/.config/pip",
-                "echo '[global]\nbreak-system-packages = true' > ~/.config/pip/pip.conf 2>/dev/null",
+                "echo '[global]\\nbreak-system-packages = true' > ~/.config/pip/pip.conf 2>/dev/null",
             ]
         },
         "web": {
@@ -146,7 +178,7 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             "pip": "flask django gunicorn",
             "npm": "typescript prettier",
             "setup": [
-                "echo 'alias dev=\"python3 -m http.server 8080\"' >> ~/.bashrc",
+                'echo \'alias dev="python3 -m http.server 8080"\' >> ~/.bashrc',
                 "mkdir -p ~/projects/web ~/projects/api",
             ]
         },
@@ -155,7 +187,7 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             "packages": "python python-pip nmap hydra openssh git curl wget tmux tsu",
             "pip": "requests scrapy beautifulsoup4 pwntools",
             "setup": [
-                "echo 'alias scan=\"nmap -sV -sC\"' >> ~/.bashrc",
+                'echo \'alias scan="nmap -sV -sC"\' >> ~/.bashrc',
                 "mkdir -p ~/pentest ~/tools ~/recon",
             ]
         },
@@ -164,7 +196,7 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             "packages": "python python-pip git vim openssh",
             "pip": "jupyter pandas matplotlib",
             "setup": [
-                "echo 'alias notes=\"cd ~/notes && vim\"' >> ~/.bashrc",
+                'echo \'alias notes="cd ~/notes && vim"\' >> ~/.bashrc',
                 "mkdir -p ~/notes ~/papers ~/research",
             ]
         },
@@ -172,15 +204,14 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             "name": "Minimal / Lightweight",
             "packages": "git vim openssh curl",
             "setup": [
-                "echo 'alias ..=\"cd ..\"' >> ~/.bashrc",
-                "echo 'alias ll=\"ls -lah\"' >> ~/.bashrc",
+                'echo \'alias ..="cd .."\' >> ~/.bashrc',
+                'echo \'alias ll="ls -lah"\' >> ~/.bashrc',
             ]
         },
     }
 
     if profile not in profiles:
-        execute_streaming(handler, f'echo Available profiles: {", ".join(profiles.keys())}')
-        return
+        return execute(f'echo Available profiles: {", ".join(profiles.keys())}')
 
     cfg = profiles[profile]
     cmds = [f'echo "🚀 Setting up: {cfg["name"]} Profile"', 'echo "---"']
@@ -208,11 +239,22 @@ def handle_profile(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             cmds.append(s)
 
     cmds.append(f'echo "✅ {cfg["name"]} profile setup complete!"')
-    execute_streaming(handler, " && ".join(cmds))
+    return execute(" && ".join(cmds))
 
 
-
-def handle_error_explain(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="error_explain",
+    description="Explain an error message and suggest fixes.",
+    schema={
+        "type": "object",
+        "properties": {
+            "error": {"type": "string", "description": "Error message text"},
+            "command": {"type": "string", "description": "Command that produced the error"},
+        },
+    },
+    category="ai_power",
+)
+def handle_error_explain(data: dict) -> str:
     error_text = data.get("error", "").strip()
     context_cmd = data.get("command", "").strip()
 
@@ -246,11 +288,21 @@ def handle_error_explain(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     ]
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_ssh_wizard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="ssh_wizard",
+    description="Set up, check, or stop SSH server on Termux.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["setup", "status", "stop"], "description": "SSH action"},
+        },
+    },
+    category="ai_power",
+)
+def handle_ssh_wizard(data: dict) -> str:
     action = data.get("action", "setup").strip()
 
     if action == "setup":
@@ -274,7 +326,7 @@ def handle_ssh_wizard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             'echo "---"',
             'echo "=== Connection Info ==="',
             'echo "Username: $(whoami)"',
-            'echo "IP: $(ifconfig wlan0 2>/dev/null | grep \"inet \" | awk \'{print $2}\' || echo unknown)"',
+            'echo "IP: $(ifconfig wlan0 2>/dev/null | grep \\"inet \\" | awk \'{print $2}\' || echo unknown)"',
             'echo "Port: 8022"',
             'echo "---"',
             'echo "Public key:"',
@@ -306,11 +358,24 @@ def handle_ssh_wizard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         checks = ['echo "Actions: setup, status, stop"']
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_service_guard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="service_guard",
+    description="Manage background services: list, start, stop, wake lock.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "start", "stop", "wake-lock", "wake-release"], "description": "Service action"},
+            "name": {"type": "string", "description": "Service name"},
+            "cmd": {"type": "string", "description": "Command to run as service (for start)"},
+        },
+        "required": ["action"],
+    },
+    category="ai_power",
+)
+def handle_service_guard(data: dict) -> str:
     action = data.get("action", "list").strip()
     service_name = data.get("name", "").strip()
     service_cmd = data.get("cmd", "").strip()
@@ -327,8 +392,7 @@ def handle_service_guard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         ]
     elif action == "start":
         if not service_name or not service_cmd:
-            _json_response(handler, 400, {"error": "Missing 'name' and 'cmd' for service"})
-            return
+            return error_msg("Missing 'name' and 'cmd' for service")
         checks = [
             f'echo "Starting service: {service_name}"',
             f'echo "Command: {service_cmd}"',
@@ -341,8 +405,7 @@ def handle_service_guard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         ]
     elif action == "stop":
         if not service_name:
-            _json_response(handler, 400, {"error": "Missing 'name' of service to stop"})
-            return
+            return error_msg("Missing 'name' of service to stop")
         checks = [
             f'echo "Stopping: {service_name}"',
             f'pkill -f {shell_quote(service_name)} 2>/dev/null && echo "  ✅ Stopped" || echo "  Service not found"',
@@ -362,11 +425,22 @@ def handle_service_guard(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         checks = ['echo "Actions: list, start, stop, wake-lock, wake-release"']
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_history_insight(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="history_insight",
+    description="Analyze shell command history for patterns and insights.",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "History file path (default: ~/.bash_history)"},
+            "limit": {"type": "integer", "description": "Number of entries to analyze (default: 100)"},
+        },
+    },
+    category="ai_power",
+)
+def handle_history_insight(data: dict) -> str:
     history_file = data.get("file", f"{HOME}/.bash_history").strip()
     limit = data.get("limit", 100)
     safe_file = shell_quote(history_file)
@@ -395,11 +469,16 @@ def handle_history_insight(handler: "BaseHTTPRequestHandler", data: dict) -> Non
     ]
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_optimize(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="optimize",
+    description="Analyze and optimize Termux: memory, CPU, disk usage, and recommendations.",
+    schema={"type": "object", "properties": {}},
+    category="ai_power",
+)
+def handle_optimize(data: dict) -> str:
     checks = [
         'echo "=== Performance Analysis ==="',
         'echo "---"',
@@ -431,11 +510,24 @@ def handle_optimize(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     ]
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_quick_cmd(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="quick_cmd",
+    description="Manage quick command aliases: list, add, remove, export.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "add", "remove", "export"], "description": "Quick command action"},
+            "name": {"type": "string", "description": "Command alias name"},
+            "cmd": {"type": "string", "description": "Command to alias (for add)"},
+        },
+        "required": ["action"],
+    },
+    category="ai_power",
+)
+def handle_quick_cmd(data: dict) -> str:
     action = data.get("action", "list").strip()
     alias_name = data.get("name", "").strip()
     alias_cmd = data.get("cmd", "").strip()
@@ -449,10 +541,7 @@ def handle_quick_cmd(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         ]
     elif action == "add":
         if not alias_name or not alias_cmd:
-            _json_response(handler, 400, {"error": "Missing 'name' and 'cmd' for alias"})
-            return
-        safe_alias = shell_quote(alias_name)
-        safe_cmd = shell_quote(alias_cmd)
+            return error_msg("Missing 'name' and 'cmd' for alias")
         checks = [
             f'echo "Adding alias: {alias_name} -> {alias_cmd}"',
             f'echo "alias {alias_name}={shell_quote(alias_cmd)}" >> ~/.bashrc',
@@ -461,8 +550,7 @@ def handle_quick_cmd(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         ]
     elif action == "remove":
         if not alias_name:
-            _json_response(handler, 400, {"error": "Missing 'name' of alias to remove"})
-            return
+            return error_msg("Missing 'name' of alias to remove")
         checks = [
             f'echo "Removing alias: {alias_name}"',
             f'sed -i "/alias {alias_name}=/d" ~/.bashrc 2>/dev/null',
@@ -480,11 +568,23 @@ def handle_quick_cmd(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         checks = ['echo "Actions: list, add, remove, export"']
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_port_manage(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="port_manage",
+    description="Manage network ports: list active, check specific port, show IP info.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "check", "ip"], "description": "Port action"},
+            "port": {"type": "string", "description": "Port number to check"},
+        },
+        "required": ["action"],
+    },
+    category="ai_power",
+)
+def handle_port_manage(data: dict) -> str:
     action = data.get("action", "list").strip()
 
     if action == "list":
@@ -507,18 +607,31 @@ def handle_port_manage(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             'echo "=== Network Interfaces ==="',
             'ifconfig 2>/dev/null | grep -E "inet |inet6 " || ip addr 2>/dev/null | grep inet || echo "  Unknown"',
             'echo "---"',
-            'echo "WiFi IP: $(ifconfig wlan0 2>/dev/null | grep \"inet \" | awk \'{print $2}\' || echo unknown)"',
+            'echo "WiFi IP: $(ifconfig wlan0 2>/dev/null | grep \\"inet \\" | awk \'{print $2}\' || echo unknown)"',
             'echo "Public IP: $(curl -s https://api.ipify.org 2>/dev/null || echo unknown)"',
         ]
     else:
         checks = ['echo "Actions: list, check, ip"']
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_migrate(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="migrate",
+    description="Backup/restore Termux environment for migration to another device.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["backup", "restore", "preview"], "description": "Migration action"},
+            "output": {"type": "string", "description": "Output file path (for backup)"},
+            "file": {"type": "string", "description": "Input file path (for restore)"},
+        },
+        "required": ["action"],
+    },
+    category="ai_power",
+)
+def handle_migrate(data: dict) -> str:
     action = data.get("action", "backup").strip()
     output = data.get("output", f"~/storage/shared/termux_migration.tar.gz").strip()
     safe_out = shell_quote(output)
@@ -560,8 +673,7 @@ def handle_migrate(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     elif action == "restore":
         archive = data.get("file", "").strip()
         if not archive:
-            _json_response(handler, 400, {"error": "Missing 'file' — path to migration archive"})
-            return
+            return error_msg("Missing 'file' — path to migration archive")
         safe_archive = shell_quote(archive)
         checks = [
             f'echo "📥 Restoring from: {archive}"',
@@ -586,8 +698,7 @@ def handle_migrate(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     elif action == "preview":
         archive = data.get("file", "").strip()
         if not archive:
-            _json_response(handler, 400, {"error": "Missing 'file' to preview"})
-            return
+            return error_msg("Missing 'file' to preview")
         safe_archive = shell_quote(archive)
         checks = [
             f'echo "📋 Migration Preview: {archive}"',
@@ -597,11 +708,21 @@ def handle_migrate(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         checks = ['echo "Actions: backup, restore, preview"']
 
     cmd = " && ".join(checks)
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_tutorial(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="tutorial",
+    description="Show interactive Termux tutorials.",
+    schema={
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string", "enum": ["basics", "python", "ssh", "storage", "customize"], "description": "Tutorial topic"},
+        },
+    },
+    category="ai_power",
+)
+def handle_tutorial(data: dict) -> str:
     topic = data.get("topic", "basics").strip()
 
     topics = {
@@ -705,4 +826,4 @@ def handle_tutorial(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = f'echo "Available topics: {", ".join(topics.keys())}"'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)

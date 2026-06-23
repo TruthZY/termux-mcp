@@ -1,15 +1,25 @@
+"""Terminal power-tools: diagnose, package manager, code review, git, backup, etc."""
+
 import os
-from typing import TYPE_CHECKING
+import re
 
-from ..shell import execute_streaming, get_current_dir
-from ..utils import json_response, shell_quote
-
-if TYPE_CHECKING:
-    from http.server import BaseHTTPRequestHandler
+from ..registry import register_tool
+from ..shell import execute, get_current_dir
+from ..utils import error_msg, shell_quote
 
 
-
-def handle_diagnose(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="diagnose",
+    description="Diagnose development environment issues (Python, Node, Git, packages, etc.).",
+    schema={
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "enum": ["python", "pip", "node", "git", "storage", "packages", "all"], "description": "What to diagnose (default: python)"},
+        },
+    },
+    category="terminal",
+)
+def handle_diagnose(data: dict) -> str:
     intent = data.get("intent", "python").strip()
     checks = []
 
@@ -53,18 +63,28 @@ def handle_diagnose(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         ]
 
     cmd = " && ".join(checks) if checks else 'echo No diagnostic target specified'
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_pkg_smart(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="pkg_smart",
+    description="Smart package installation with dependency resolution.",
+    schema={
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "description": "Package name or description of what to install"},
+            "install": {"type": "boolean", "description": "Actually install (false = dry run)"},
+        },
+        "required": ["intent"],
+    },
+    category="terminal",
+)
+def handle_pkg_smart(data: dict) -> str:
     intent = data.get("intent", "").strip().lower()
     if not intent:
-        _json_response(handler, 400, {"error": "Missing 'intent'. Describe what you want to do."})
-        return
+        return error_msg("Missing 'intent'. Describe what you want to do.")
 
     do_install = data.get("install", False)
-    import re
 
     intent_map = {
         "video":      ("ffmpeg imagemagick", "ffmpeg -version"),
@@ -145,15 +165,25 @@ def handle_pkg_smart(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = f'echo No matching packages found for: {shell_quote(intent)}; echo Try broader terms like: python, video, web server, nodejs, c++'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_explain(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="explain",
+    description="Explain what a shell command does in plain language.",
+    schema={
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string", "description": "Command to explain"},
+        },
+        "required": ["cmd"],
+    },
+    category="terminal",
+)
+def handle_explain(data: dict) -> str:
     cmd = data.get("cmd", "").strip()
     if not cmd:
-        _json_response(handler, 400, {"error": "Missing 'cmd' to explain"})
-        return
+        return error_msg("Missing 'cmd' to explain")
 
     qcmd = shell_quote(cmd)
     parts = []
@@ -189,11 +219,23 @@ def handle_explain(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         parts.append(f'which {qfirst} 2>/dev/null && echo "Command found" || echo "Command NOT found — you may need to install it"')
 
     script = " && ".join(parts) if parts else f'echo Command: {qcmd}'
-    execute_streaming(handler, f'{script} && echo "---" && echo Original command: {qcmd}')
+    return execute(f'{script} && echo "---" && echo Original command: {qcmd}')
 
 
-
-def handle_dev_env(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="dev_env",
+    description="Set up a development environment for a specific language/framework.",
+    schema={
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "enum": ["python", "bot", "react", "node", "c", "rust", "data", "termux"], "description": "Environment type"},
+            "name": {"type": "string", "description": "Project name (default: myproject)"},
+        },
+        "required": ["intent"],
+    },
+    category="terminal",
+)
+def handle_dev_env(data: dict) -> str:
     intent = data.get("intent", "python").strip().lower()
     cwd = get_current_dir()
     project_name = data.get("name", "myproject").strip()
@@ -271,17 +313,27 @@ def handle_dev_env(handler: "BaseHTTPRequestHandler", data: dict) -> None:
 
     if intent in setups:
         title, cmd = setups[intent]
-        execute_streaming(handler, f'echo "🚀 Setting up: {title}"; echo "---"; {cmd}')
+        return execute(f'echo "🚀 Setting up: {title}"; echo "---"; {cmd}')
     else:
-        execute_streaming(handler, f'echo "Available environments:"; echo "python, bot, react, node, c, rust, data, termux"')
+        return execute('echo "Available environments:"; echo "python, bot, react, node, c, rust, data, termux"')
 
 
-
-def handle_review(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="review",
+    description="Review a code file: syntax check, linting, suggestions.",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "File path to review"},
+        },
+        "required": ["file"],
+    },
+    category="terminal",
+)
+def handle_review(data: dict) -> str:
     file_path = data.get("file", "").strip()
     if not file_path:
-        _json_response(handler, 400, {"error": "Missing 'file' path"})
-        return
+        return error_msg("Missing 'file' path")
 
     safe_path = shell_quote(file_path)
     ext = os.path.splitext(file_path)[1].lower()
@@ -322,15 +374,25 @@ def handle_review(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             f'clang -fsyntax-only -Wall {safe_path} 2>&1 | head -20 || echo "clang not installed"',
         ]
 
-    execute_streaming(handler, " && ".join(checks))
+    return execute(" && ".join(checks))
 
 
-
-def handle_log_analyze(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="log_analyze",
+    description="Analyze a log file and extract errors/warnings.",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "Log file path to analyze"},
+        },
+        "required": ["file"],
+    },
+    category="terminal",
+)
+def handle_log_analyze(data: dict) -> str:
     file_path = data.get("file", "").strip()
     if not file_path:
-        _json_response(handler, 400, {"error": "Missing 'file' path"})
-        return
+        return error_msg("Missing 'file' path")
 
     safe_path = shell_quote(file_path)
     cmd = (
@@ -341,18 +403,30 @@ def handle_log_analyze(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         f'echo "Errors found:"; '
         f'grep -i -E "error|fail|crash|fatal|exception|traceback|panic|segfault" {safe_path} 2>/dev/null | tail -30 || echo "No errors detected"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_script_gen(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="script_gen",
+    description="Generate a shell or Python script from a description.",
+    schema={
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "description": "What the script should do"},
+            "type": {"type": "string", "enum": ["sh", "py"], "description": "Script type (sh or py)"},
+            "output": {"type": "string", "description": "Output file path"},
+        },
+        "required": ["description"],
+    },
+    category="terminal",
+)
+def handle_script_gen(data: dict) -> str:
     description = data.get("description", "").strip()
     script_type = data.get("type", "sh").strip()
     output = data.get("output", "").strip()
 
     if not description:
-        _json_response(handler, 400, {"error": "Missing 'description' of what the script should do"})
-        return
+        return error_msg("Missing 'description' of what the script should do")
 
     safe_out = shell_quote(output) if output else ""
     if script_type == "py":
@@ -361,22 +435,32 @@ def handle_script_gen(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         template = f'echo "#!/data/data/com.termux/files/usr/bin/bash\\n# Script: {output or "script.sh"}\\n# {description}\\n\\nset -e\\n" > {safe_out} && chmod +x {safe_out} && echo "Bash script created: {output}"'
 
     if output:
-        execute_streaming(handler, template)
+        return execute(template)
     else:
-        execute_streaming(handler, f'echo "Script described: {description}"\necho "To generate, provide an output path"')
+        return execute(f'echo "Script described: {description}"; echo "To generate, provide an output path"')
 
 
-
-def handle_deps_tree(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="deps_tree",
+    description="Show dependency tree for a package.",
+    schema={
+        "type": "object",
+        "properties": {
+            "package": {"type": "string", "description": "Package name (optional)"},
+        },
+    },
+    category="terminal",
+)
+def handle_deps_tree(data: dict) -> str:
     package = data.get("package", "").strip()
     if package:
-        execute_streaming(handler,
+        return execute(
             f'echo "=== Reverse depends for: {package} ===" && '
             f'apt-cache rdepends {shell_quote(package)} 2>/dev/null | head -30 || '
             f'echo "Package not found"'
         )
     else:
-        execute_streaming(handler,
+        return execute(
             f'echo "=== Installed Packages ===" && '
             f'pkg list-installed 2>/dev/null | wc -l && echo "packages total" && '
             f'echo "---" && '
@@ -386,9 +470,14 @@ def handle_deps_tree(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         )
 
 
-
-def handle_storage_audit(handler: "BaseHTTPRequestHandler", data: dict) -> None:
-    execute_streaming(handler,
+@register_tool(
+    name="storage_audit",
+    description="Audit storage usage: disk usage, caches, cleanup suggestions.",
+    schema={"type": "object", "properties": {}},
+    category="terminal",
+)
+def handle_storage_audit(data: dict) -> str:
+    return execute(
         'echo "=== Storage Usage ==="; '
         'df -h /data 2>/dev/null | tail -1; '
         'echo "---"; '
@@ -415,8 +504,18 @@ def handle_storage_audit(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     )
 
 
-
-def handle_config_fix(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="config_fix",
+    description="Fix common configuration issues (bashrc, zshrc, termux settings, fonts, etc.).",
+    schema={
+        "type": "object",
+        "properties": {
+            "config": {"type": "string", "enum": ["bashrc", "zshrc", "termux", "font", "colors", "storage", "path", "env", "all"], "description": "Config to fix"},
+        },
+    },
+    category="terminal",
+)
+def handle_config_fix(data: dict) -> str:
     which_config = data.get("config", "all").strip()
 
     checks = []
@@ -438,11 +537,24 @@ def handle_config_fix(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         checks.append('echo "=== Environment ===" && env | sort | head -30')
 
     cmd = " && ".join(checks) if checks else 'echo Specify: bashrc, zshrc, termux, font, colors, storage, path, env, or all'
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_git_smart(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="git_smart",
+    description="Smart Git operations: diff summary, recent log, commit suggestions, conflict resolution.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "description": "diff-summary, log-recent, suggest-commit, fix-conflict, or raw git command"},
+            "repo_dir": {"type": "string", "description": "Repository directory"},
+            "limit": {"type": "integer", "description": "Limit results"},
+        },
+        "required": ["action"],
+    },
+    category="terminal",
+)
+def handle_git_smart(data: dict) -> str:
     action = data.get("action", "diff").strip()
     repo_dir = data.get("repo_dir", get_current_dir()).strip()
     safe_dir = shell_quote(repo_dir)
@@ -459,17 +571,28 @@ def handle_git_smart(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = f'cd {safe_dir} && git {action} 2>&1 | tail -30'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_regex(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="regex_test",
+    description="Test a regular expression pattern against sample text.",
+    schema={
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Regular expression pattern"},
+            "test": {"type": "string", "description": "Test string to match against"},
+        },
+        "required": ["pattern"],
+    },
+    category="terminal",
+)
+def handle_regex(data: dict) -> str:
     pattern = data.get("pattern", "").strip()
     test_str = data.get("test", "").strip()
 
     if not pattern:
-        _json_response(handler, 400, {"error": "Missing 'pattern'"})
-        return
+        return error_msg("Missing 'pattern'")
 
     safe_pattern = shell_quote(pattern)
     if test_str:
@@ -484,20 +607,30 @@ def handle_regex(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = f'echo "Pattern: {pattern}" && echo "Provide a test string to check matches"'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_db_design(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="db_design",
+    description="Design a database schema from a description and generate SQL.",
+    schema={
+        "type": "object",
+        "properties": {
+            "schema": {"type": "string", "description": "Schema description"},
+            "output": {"type": "string", "description": "Output SQL file path"},
+        },
+        "required": ["schema"],
+    },
+    category="terminal",
+)
+def handle_db_design(data: dict) -> str:
     schema = data.get("schema", "").strip()
     db_path = data.get("output", get_current_dir() + "/database.sqlite").strip()
 
     if not schema:
-        _json_response(handler, 400, {"error": "Missing 'schema' — describe your tables"})
-        return
+        return error_msg("Missing 'schema' — describe your tables")
 
     safe_db = shell_quote(db_path)
-    # Just create the database file and echo back the schema
     cmd = (
         f'touch {safe_db} 2>/dev/null && '
         f'echo "Database created: {db_path}" && '
@@ -507,16 +640,29 @@ def handle_db_design(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         f'echo "---" && '
         f'echo "Use /db-query to run SQL. Example: CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_backup(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="backup",
+    description="Backup Termux home, packages, or configs.",
+    schema={
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "enum": ["home", "packages", "configs"], "description": "What to backup"},
+            "output": {"type": "string", "description": "Output archive path"},
+            "include": {"type": "string", "description": "Comma-separated extra paths to include"},
+        },
+        "required": ["target"],
+    },
+    category="terminal",
+)
+def handle_backup(data: dict) -> str:
+    import time
     target = data.get("target", "home").strip()
     output = data.get("output", "").strip()
     include = data.get("include", "").strip().split(",") if data.get("include", "").strip() else []
 
-    import time
     home = os.environ.get("HOME", "/data/data/com.termux/files/home")
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -562,17 +708,28 @@ def handle_backup(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = 'echo "Targets: home, packages, configs. Or specify include: path1,path2"'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-
-def handle_restore(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="restore",
+    description="Restore from a backup archive.",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "Backup archive file path"},
+            "target": {"type": "string", "enum": ["home", "packages", "configs", "info"], "description": "What to restore"},
+        },
+        "required": ["file"],
+    },
+    category="terminal",
+)
+def handle_restore(data: dict) -> str:
     backup_file = data.get("file", "").strip()
     target = data.get("target", "home").strip()
 
     if not backup_file:
-        _json_response(handler, 400, {"error": "Missing 'file' — path to backup archive"})
-        return
+        return error_msg("Missing 'file' — path to backup archive")
 
     safe_file = shell_quote(backup_file)
     home = os.environ.get("HOME", "/data/data/com.termux/files/home")
@@ -608,4 +765,7 @@ def handle_restore(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     else:
         cmd = 'echo "Targets: home, packages, configs, info"'
 
-    execute_streaming(handler, cmd)
+    return execute(cmd)
+import os
+from typing import TYPE_CHECKING
+

@@ -1,17 +1,26 @@
+"""Extended features: system info, process mgmt, cron, diff/patch, recipes, context, etc."""
+
+import base64
+import json
 import os
 import time
-from typing import TYPE_CHECKING
 
-from ..shell import execute_streaming, get_current_dir
-from ..utils import shell_quote, is_safe_path, json_response
-
-if TYPE_CHECKING:
-    from http.server import BaseHTTPRequestHandler
+from ..registry import register_tool
+from ..shell import execute, get_current_dir
+from ..utils import error_msg, is_safe_path, json_result, shell_quote
 
 HOME = os.environ.get("HOME", "/data/data/com.termux/files/home")
 
 
-def handle_system_info(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+# ── System & Process ────────────────────────────────────────────────────
+
+@register_tool(
+    name="system_info",
+    description="Get system info: CPU usage, RAM, disk, temperature, uptime (JSON).",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_system_info(data: dict) -> str:
     cmd = (
         'cpu=$(top -bn1 2>/dev/null | grep -oP "[0-9.]+%" | head -1 | tr -d "%" || echo 0);'
         'ram_total=$(free -m 2>/dev/null | awk "/Mem:/{print \\$2}" || echo 0);'
@@ -22,43 +31,81 @@ def handle_system_info(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
         'uptime=0; [ -r /proc/uptime ] && uptime=$(awk "{print int(\\$1)}" /proc/uptime);'
         'echo "{\\"cpu_percent\\":\\"$cpu\\",\\"ram_mb_total\\":$ram_total,\\"ram_mb_used\\":$ram_used,\\"disk_mb_total\\":$disk_total,\\"disk_mb_used\\":$disk_used,\\"temp_celsius\\":$temp,\\"uptime_seconds\\":$uptime}"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_process_list(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="process_list",
+    description="List running processes with CPU/memory usage.",
+    schema={
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max processes to show (default: 20)"},
+        },
+    },
+    category="features",
+)
+def handle_process_list(data: dict) -> str:
     limit = str(data.get("limit", 20))
     cmd = (
         f'echo "PID USER CPU% MEM% COMMAND";'
         f'ps aux --sort=-%cpu 2>/dev/null | head -n {limit} | '
         f'while read u p c m r; do printf "%-6s %-8s %-5s %-5s %s\\n" "$p" "$u" "$c" "$m" "$r"; done'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_process_kill(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="process_kill",
+    description="Kill a process by PID.",
+    schema={
+        "type": "object",
+        "properties": {
+            "pid": {"type": "integer", "description": "Process ID to kill"},
+            "signal": {"type": "integer", "description": "Signal number (default: 15 SIGTERM)"},
+        },
+        "required": ["pid"],
+    },
+    category="features",
+)
+def handle_process_kill(data: dict) -> str:
     pid = str(data.get("pid", "")).strip()
     signal_num = str(data.get("signal", "15")).strip()
 
     if not pid or not pid.isdigit():
-        json_response(handler, 400, {"error": "Valid PID required"})
-        return
+        return error_msg("Valid PID required")
 
     cmd = (
         f'echo "Killing PID {pid} ...";'
         f'kill -{signal_num} {pid} 2>&1 && echo "Process {pid} terminated" '
         f'|| echo "Failed to kill process {pid}"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_cron_add(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+# ── Cron ─────────────────────────────────────────────────────────────────
+
+@register_tool(
+    name="cron_add",
+    description="Schedule a recurring command using Termux cron.",
+    schema={
+        "type": "object",
+        "properties": {
+            "schedule": {"type": "string", "description": "Cron schedule expression"},
+            "command": {"type": "string", "description": "Command to run"},
+            "label": {"type": "string", "description": "Job label for identification"},
+        },
+        "required": ["schedule", "command"],
+    },
+    category="features",
+)
+def handle_cron_add(data: dict) -> str:
     schedule = data.get("schedule", "").strip()
     command = data.get("command", "").strip()
     label = data.get("label", "termux_task").strip()
 
     if not schedule or not command:
-        json_response(handler, 400, {"error": "schedule and command required"})
-        return
+        return error_msg("schedule and command required")
 
     cmd = (
         f'echo "Adding cron job: {label}";'
@@ -67,23 +114,39 @@ def handle_cron_add(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         f'echo "Cron job added: {schedule} {command}" '
         f'|| echo "Failed. Install: pkg install cronie termux-services"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_cron_list(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+@register_tool(
+    name="cron_list",
+    description="List all scheduled cron jobs.",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_cron_list(data: dict) -> str:
     cmd = (
         'echo "Cron Jobs:";'
         'echo "---";'
         'crontab -l 2>&1 || echo "No cron jobs. Install: pkg install cronie termux-services"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_cron_remove(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="cron_remove",
+    description="Remove a scheduled cron job by label.",
+    schema={
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "Job label to remove"},
+        },
+    },
+    category="features",
+)
+def handle_cron_remove(data: dict) -> str:
     label = data.get("label", "").strip()
 
     if label:
-        safe = shell_quote(label)
         cmd = (
             f'crontab -l 2>/dev/null | grep -v "{label}" | crontab - 2>&1 && '
             f'echo "Removed cron jobs matching: {label}" '
@@ -94,23 +157,36 @@ def handle_cron_remove(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             'crontab -r 2>&1 && echo "All cron jobs removed" '
             '|| echo "No cron jobs to remove"'
         )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_diff(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+# ── Diff & Patch ─────────────────────────────────────────────────────────
+
+@register_tool(
+    name="diff_files",
+    description="Show differences between two files (or a file and its backup).",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "First file path"},
+            "file2": {"type": "string", "description": "Second file path (optional)"},
+        },
+        "required": ["file"],
+    },
+    category="features",
+)
+def handle_diff(data: dict) -> str:
     file1 = data.get("file", "").strip()
     file2 = data.get("file2", "").strip()
 
     if not file1 or not is_safe_path(file1):
-        json_response(handler, 400, {"error": "Valid file path required"})
-        return
+        return error_msg("Valid file path required")
 
     safe1 = shell_quote(file1)
 
     if file2:
         if not is_safe_path(file2):
-            json_response(handler, 400, {"error": "Invalid file2 path"})
-            return
+            return error_msg("Invalid file2 path")
         safe2 = shell_quote(file2)
         cmd = f'diff -u {safe1} {safe2} 2>&1 || echo "(files differ or one missing)"'
     else:
@@ -120,21 +196,31 @@ def handle_diff(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             f'echo "Last modified: $(stat -c %y {safe1} 2>/dev/null)";'
             f'echo "Size: $(stat -c %s {safe1} 2>/dev/null) bytes"'
         )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_patch(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="patch_file",
+    description="Apply a unified diff patch to a file.",
+    schema={
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "File to patch"},
+            "patch": {"type": "string", "description": "Patch content (unified diff format)"},
+        },
+        "required": ["file", "patch"],
+    },
+    category="features",
+)
+def handle_patch(data: dict) -> str:
     target = data.get("file", "").strip()
     patch_content = data.get("patch", "").strip()
 
     if not target or not is_safe_path(target):
-        json_response(handler, 400, {"error": "Valid file path required"})
-        return
+        return error_msg("Valid file path required")
     if not patch_content:
-        json_response(handler, 400, {"error": "patch content required"})
-        return
+        return error_msg("patch content required")
 
-    import base64
     safe_file = shell_quote(target)
     encoded = base64.b64encode(patch_content.encode()).decode()
 
@@ -144,10 +230,18 @@ def handle_patch(handler: "BaseHTTPRequestHandler", data: dict) -> None:
         f'echo "Patch applied to {target}" || '
         f'echo "Patch failed - check the diff format"'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_health(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+# ── Health ───────────────────────────────────────────────────────────────
+
+@register_tool(
+    name="health",
+    description="Run a full system health diagnostic check.",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_health(data: dict) -> str:
     cmd = (
         'echo "═══════════════════════════════════";'
         'echo "   🔍 Termux Health Check";'
@@ -179,15 +273,32 @@ def handle_health(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
         'done;'
         'echo "";'
         'echo "🖥️ MCP Server:";'
-        'echo "  ✅ Running on port ${TERMUX_MCP_PORT:-8080}";'
+        'echo "  ✅ Running";'
         'echo "";'
         'echo "═══════════════════════════════════";'
         'echo "Health check complete."'
     )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_cloud_sync(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+# ── Cloud Sync ───────────────────────────────────────────────────────────
+
+@register_tool(
+    name="cloud_sync",
+    description="Sync files to/from cloud storage.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["backup", "restore", "list"], "description": "Sync action"},
+            "target": {"type": "string", "description": "Target path"},
+            "output": {"type": "string", "description": "Output path"},
+            "file": {"type": "string", "description": "File path for restore"},
+        },
+        "required": ["action"],
+    },
+    category="features",
+)
+def handle_cloud_sync(data: dict) -> str:
     action = data.get("action", "backup").strip()
 
     if action == "backup":
@@ -211,8 +322,7 @@ def handle_cloud_sync(handler: "BaseHTTPRequestHandler", data: dict) -> None:
     elif action == "restore":
         backup_file = data.get("file", "").strip()
         if not backup_file:
-            execute_streaming(handler, 'echo "Specify backup file to restore"')
-            return
+            return execute('echo "Specify backup file to restore"')
         safe_file = shell_quote(backup_file)
         cmd = (
             f'echo "Restoring from: {backup_file}";'
@@ -224,10 +334,33 @@ def handle_cloud_sync(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             'echo "Available backups:";'
             f'ls -lh {shell_quote(HOME)}/*.tar.gz 2>/dev/null || echo "No local backups found"'
         )
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_git_pr(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+# ── GitHub PR ────────────────────────────────────────────────────────────
+
+@register_tool(
+    name="git_pr",
+    description="Manage GitHub pull requests: list, view, diff, merge, approve, create.",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "view", "diff", "merge", "approve", "status", "create"], "description": "PR action"},
+            "repo": {"type": "string", "description": "Repository (owner/name)"},
+            "number": {"type": "integer", "description": "PR number"},
+            "state": {"type": "string", "description": "PR state filter (open/closed/all)"},
+            "limit": {"type": "integer", "description": "Limit results"},
+            "title": {"type": "string", "description": "PR title (for create)"},
+            "body": {"type": "string", "description": "PR body (for create)"},
+            "base": {"type": "string", "description": "Base branch (for create)"},
+            "draft": {"type": "boolean", "description": "Create as draft PR"},
+        },
+        "required": ["action"],
+    },
+    category="features",
+    requires=[{"pkg": "gh", "install": "pkg install gh && gh auth login"}],
+)
+def handle_git_pr(data: dict) -> str:
     action = data.get("action", "list").strip()
     repo = data.get("repo", "").strip()
     number = str(data.get("number", "")).strip()
@@ -241,30 +374,37 @@ def handle_git_pr(handler: "BaseHTTPRequestHandler", data: dict) -> None:
             f'gh pr list --state {state} --limit {limit} {flags} 2>&1 || echo "Install: pkg install gh && gh auth login"'
         )
     elif action == "view":
-        if not number: json_response(handler, 400, {"error": "PR number required"}); return
+        if not number:
+            return error_msg("PR number required")
         cmd = f'gh pr view {number} {flags} 2>&1 || echo "PR #{number} not found"'
     elif action == "diff":
-        if not number: json_response(handler, 400, {"error": "PR number required"}); return
+        if not number:
+            return error_msg("PR number required")
         cmd = f'gh pr diff {number} {flags} 2>&1 | head -300 || echo "Cannot show diff"'
     elif action == "merge":
-        if not number: json_response(handler, 400, {"error": "PR number required"}); return
+        if not number:
+            return error_msg("PR number required")
         method = data.get("method", "merge").strip()
         cmd = f'echo "Merging PR #{number}..."; gh pr merge {number} --{method} {flags} 2>&1 || echo "Merge failed"'
     elif action == "approve":
-        if not number: json_response(handler, 400, {"error": "PR number required"}); return
+        if not number:
+            return error_msg("PR number required")
         cmd = f'gh pr review {number} --approve {flags} 2>&1 || echo "Approve failed"'
     elif action == "status":
         cmd = f'echo "PR Status:"; gh pr status {flags} 2>&1 || echo "No PRs or gh not configured"'
     elif action == "create":
         title = data.get("title", "").strip()
-        if not title: json_response(handler, 400, {"error": "PR title required"}); return
+        if not title:
+            return error_msg("PR title required")
         body = data.get("body", "").strip()
         draft = " --draft" if data.get("draft", False) else ""
         cmd = f'echo "Creating: {title}..."; gh pr create --title {shell_quote(title)} --body {shell_quote(body or "")} --base {shell_quote(data.get("base","main").strip())}{draft} {flags} 2>&1 || echo "Create failed"'
     else:
         cmd = 'echo "Actions: list view diff merge approve status create"'
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
+
+# ── Recipes ──────────────────────────────────────────────────────────────
 
 RECIPES_FILE = os.path.join(HOME, ".termux_recipes.json")
 
@@ -320,7 +460,6 @@ DEFAULT_RECIPES = {
 
 
 def _load_recipes() -> dict:
-    import json
     try:
         with open(RECIPES_FILE) as f:
             return json.load(f)
@@ -330,66 +469,101 @@ def _load_recipes() -> dict:
 
 
 def _save_recipes(data: dict) -> None:
-    import json
     os.makedirs(os.path.dirname(RECIPES_FILE) or ".", exist_ok=True)
     with open(RECIPES_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def handle_recipe_list(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
+@register_tool(
+    name="recipe_list",
+    description="List saved automation recipes.",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_recipe_list(data: dict) -> str:
     recipes = _load_recipes()
     lines = ["Available Recipes:", "---"]
     for key, r in recipes.items():
         lines.append(f"  {key} - {r['name']}: {r['desc']}")
-    output = "\n".join(lines) + "\n"
-    body = output.encode()
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/plain")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+    return "\n".join(lines) + "\n"
 
 
-def handle_recipe_run(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="recipe_run",
+    description="Run a saved automation recipe by name.",
+    schema={
+        "type": "object",
+        "properties": {
+            "recipe": {"type": "string", "description": "Recipe name to run"},
+        },
+    },
+    category="features",
+)
+def handle_recipe_run(data: dict) -> str:
     recipe_id = data.get("recipe", "").strip()
     recipes = _load_recipes()
-    recipe = recipes.get(recipe_id) or recipes.get(list(recipes.keys())[0]) if recipes else None
+    recipe = recipes.get(recipe_id) or (recipes.get(list(recipes.keys())[0]) if recipes else None)
     if not recipe:
-        json_response(handler, 404, {"error": f"Recipe '{recipe_id}' not found"})
-        return
+        return error_msg(f"Recipe '{recipe_id}' not found")
     cmd = " && ".join([f'echo "> {s}" && {s}' for s in recipe["steps"]])
-    execute_streaming(handler, cmd)
+    return execute(cmd)
 
 
-def handle_recipe_save(handler: "BaseHTTPRequestHandler", data: dict) -> None:
+@register_tool(
+    name="recipe_save",
+    description="Save a multi-step automation recipe.",
+    schema={
+        "type": "object",
+        "properties": {
+            "recipe": {"type": "string", "description": "Recipe identifier"},
+            "name": {"type": "string", "description": "Display name"},
+            "desc": {"type": "string", "description": "Description"},
+            "steps": {"type": "array", "items": {"type": "string"}, "description": "List of shell commands to execute"},
+        },
+        "required": ["recipe", "name", "steps"],
+    },
+    category="features",
+)
+def handle_recipe_save(data: dict) -> str:
     recipe_id = data.get("recipe", "").strip()
     name = data.get("name", "").strip()
     desc = data.get("desc", "").strip()
     steps = data.get("steps", [])
     if not recipe_id or not name or not steps:
-        json_response(handler, 400, {"error": "recipe, name, and steps required"})
-        return
+        return error_msg("recipe, name, and steps required")
     recipes = _load_recipes()
     recipes[recipe_id] = {"name": name, "desc": desc, "steps": steps}
     _save_recipes(recipes)
-    json_response(handler, 200, {"saved": recipe_id, "total": len(recipes)})
+    return json_result({"saved": recipe_id, "total": len(recipes)})
 
+
+# ── Context ──────────────────────────────────────────────────────────────
 
 CONTEXT_FILE = os.path.join(HOME, ".termux_context.json")
 
 
-def handle_context(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
-    import json
+@register_tool(
+    name="context",
+    description="Get current Termux context: hostname, packages, environment info.",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_context(data: dict) -> str:
     try:
         with open(CONTEXT_FILE) as f:
-            data = json.load(f)
+            ctx = json.load(f)
     except Exception:
-        data = {"note": "No context saved yet. Run context-save first."}
-    json_response(handler, 200, data)
+        ctx = {"note": "No context saved yet. Run context-save first."}
+    return json_result(ctx)
 
 
-def handle_context_save(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
-    import json, time
+@register_tool(
+    name="context_save",
+    description="Save current context snapshot for later reference.",
+    schema={"type": "object", "properties": {}},
+    category="features",
+)
+def handle_context_save(data: dict) -> str:
     context = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "hostname": os.popen("hostname 2>/dev/null || echo termux").read().strip(),
@@ -402,6 +576,10 @@ def handle_context_save(handler: "BaseHTTPRequestHandler", _data: dict) -> None:
     try:
         with open(CONTEXT_FILE, "w") as f:
             json.dump(context, f, indent=2)
-        json_response(handler, 200, {"saved": context})
+        return json_result({"saved": context})
     except Exception as e:
-        json_response(handler, 500, {"error": str(e)})
+        return error_msg(str(e))
+import os
+import time
+from typing import TYPE_CHECKING
+

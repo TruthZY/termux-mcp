@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import re
 import shlex
@@ -24,14 +25,14 @@ def shell_quote_num(value) -> str:
         return shell_quote(str(value))
 
 
-def json_response(handler, status: int, data: dict) -> None:
-    import json
-    body = json.dumps(data).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+def error_msg(msg: str) -> str:
+    """Return a formatted error string for handler responses."""
+    return f"Error: {msg}"
+
+
+def json_result(data: dict) -> str:
+    """Serialize a dict to a JSON string for handler responses."""
+    return json.dumps(data, ensure_ascii=False)
 
 
 def is_safe_path(path: str) -> bool:
