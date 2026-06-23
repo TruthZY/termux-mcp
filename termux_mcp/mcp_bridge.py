@@ -1,249 +1,391 @@
 """
-MCP Protocol Bridge for Termux-MCP
-====================================
-Adds Model Context Protocol (Streamable HTTP) support on top of the
-existing REST API server. MiClaw (or any MCP client) connects to
-/mcp and gets standard JSON-RPC 2.0 responses.
+MCP Protocol Bridge for Termux-MCP (Standalone Mode)
+=====================================================
+Runs MCP protocol directly — no separate REST server needed.
+Tool calls invoke the existing handlers in-process via a mock
+HTTP handler that captures output.
 
-Architecture:
-  - Original HTTP server runs on 127.0.0.1:8080 (unchanged)
-  - MCP server runs on 0.0.0.0:3000, exposes /mcp endpoint
-  - tools/call → internal HTTP request to original server → return result
-
-No external dependencies — uses only Python standard library.
+No external dependencies — pure Python standard library.
 """
 
+import io
 import json
 import logging
 import threading
-import urllib.request
-import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from uuid import uuid4
 
-from .config import AUTH_TOKEN, REQUIRE_AUTH
+from .config import AUTH_TOKEN, REQUIRE_AUTH, HOST, PORT
 from .mcp_tools import MCP_TOOLS
 
 logger = logging.getLogger(__name__)
 
-# ─── MCP Server Configuration ───────────────────────────────────────────
 MCP_HOST = "0.0.0.0"
 MCP_PORT = 3000
 
-# Where the original termux-mcp server runs
-INTERNAL_HOST = "127.0.0.1"
-INTERNAL_PORT = 8080
+
+# ─── Fake HTTP Handler (captures handler output in-memory) ─────────────
+
+class _CaptureBuffer:
+    """Captures bytes written by handlers."""
+    def __init__(self):
+        self.buf = io.BytesIO()
+
+    def write(self, data):
+        self.buf.write(data)
+
+    def getvalue(self):
+        return self.buf.getvalue()
+
+    def flush(self):
+        pass
 
 
-# ─── Internal HTTP Bridge ───────────────────────────────────────────────
+class FakeHandler(BaseHTTPRequestHandler):
+    """
+    A fake HTTP request handler that captures output in memory.
+    Used to invoke existing handlers without a real HTTP server.
+    """
 
-def _call_internal(endpoint: str, payload: dict, method: str = "POST") -> str:
-    """Make an HTTP request to the original server and return the response body."""
-    url = f"http://{INTERNAL_HOST}:{INTERNAL_PORT}{endpoint}"
+    protocol_version = "HTTP/1.1"
 
-    if method == "GET":
-        req = urllib.request.Request(url, method="GET")
-    else:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
+    def __init__(self, method: str = "POST", path: str = "/",
+                 body: dict | None = None, headers: dict | None = None):
+        self._method = method
+        self._path = path
+        self._body = body or {}
+        self._extra_headers = headers or {}
+        self._response_code = 200
+        self._response_headers: list[tuple[str, str]] = []
+        self._wfile = _CaptureBuffer()
 
-    # Forward auth token if required
-    if REQUIRE_AUTH and AUTH_TOKEN:
-        req.add_header("Authorization", f"Bearer {AUTH_TOKEN}")
+        # Required attributes that handlers access
+        self.requestline = f"{method} {path} HTTP/1.1"
+        self.client_address = ("127.0.0.1", 0)
+        self.server_version = "FakeServer/1.0"
+        self.sys_version = ""
+
+    # ── Attributes expected by handlers ──
+
+    @property
+    def wfile(self):
+        return self._wfile
+
+    @property
+    def rfile(self):
+        body_bytes = json.dumps(self._body).encode("utf-8")
+        return io.BytesIO(body_bytes)
+
+    @property
+    def headers(self):
+        """Return a dict-like headers object."""
+        h = _FakeHeaders(self._extra_headers)
+        body_bytes = json.dumps(self._body).encode("utf-8")
+        h["Content-Length"] = str(len(body_bytes))
+        h["Content-Type"] = "application/json"
+        return h
+
+    @property
+    def command(self):
+        return self._method
+
+    @property
+    def path(self):
+        return self._path
+
+    @property
+    def request(self):
+        """Some handlers access self.request for the socket."""
+        return None
+
+    # ── Methods called by handlers to write responses ──
+
+    def send_response(self, code, message=None):
+        self._response_code = code
+
+    def send_header(self, key, value):
+        self._response_headers.append((key, str(value)))
+
+    def end_headers(self):
+        pass
+
+    def flush_headers(self):
+        pass
+
+    def log_message(self, fmt, *args):
+        pass  # suppress handler logs
+
+    # ── Response access ──
+
+    def get_body(self) -> str:
+        raw = self._wfile.getvalue()
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace")
+
+
+class _FakeHeaders:
+    """Minimal dict-like headers object."""
+    def __init__(self, initial: dict | None = None):
+        self._h = dict(initial or {})
+
+    def get(self, key, default=""):
+        return self._h.get(key, default)
+
+    def __getitem__(self, key):
+        return self._h[key]
+
+    def __setitem__(self, key, value):
+        self._h[key] = value
+
+    def __contains__(self, key):
+        return key in self._h
+
+    def keys(self):
+        return self._h.keys()
+
+    def items(self):
+        return self._h.items()
+
+    def as_string(self, *args, **kwargs):
+        return "\r\n".join(f"{k}: {v}" for k, v in self._h.items())
+
+
+# ─── Endpoint → Handler Mapping ──────────────────────────────────────────
+
+def _build_handler_map() -> dict:
+    """Build mapping from endpoint path to handler function."""
+    from .handler import MCPHandler
+    from .handlers.terminal import (
+        handle_diagnose, handle_pkg_smart, handle_explain, handle_dev_env,
+        handle_review, handle_log_analyze, handle_script_gen, handle_deps_tree,
+        handle_storage_audit, handle_config_fix, handle_git_smart, handle_regex,
+        handle_db_design, handle_backup, handle_restore,
+    )
+    from .handlers.features import (
+        handle_system_info, handle_process_list, handle_process_kill,
+        handle_cron_add, handle_cron_list, handle_cron_remove,
+        handle_diff, handle_patch, handle_health, handle_cloud_sync,
+        handle_git_pr, handle_recipe_list, handle_recipe_run, handle_recipe_save,
+        handle_context, handle_context_save,
+    )
+    from .handlers.history import (
+        handle_history_list, handle_history_save, handle_history_clear,
+    )
+    from .handlers.ai_power import (
+        handle_smart_install, handle_permission_fix, handle_profile,
+        handle_error_explain, handle_ssh_wizard, handle_service_guard,
+        handle_history_insight, handle_optimize, handle_quick_cmd,
+        handle_port_manage, handle_migrate, handle_tutorial,
+    )
+
+    return {
+        # External handlers (from handler modules)
+        "/diagnose": handle_diagnose,
+        "/pkg-smart": handle_pkg_smart,
+        "/explain": handle_explain,
+        "/dev-env": handle_dev_env,
+        "/review": handle_review,
+        "/log-analyze": handle_log_analyze,
+        "/script-gen": handle_script_gen,
+        "/deps-tree": handle_deps_tree,
+        "/storage-audit": handle_storage_audit,
+        "/config-fix": handle_config_fix,
+        "/git-smart": handle_git_smart,
+        "/regex": handle_regex,
+        "/db-design": handle_db_design,
+        "/backup": handle_backup,
+        "/restore": handle_restore,
+        "/system-info": handle_system_info,
+        "/process-list": handle_process_list,
+        "/process-kill": handle_process_kill,
+        "/cron-add": handle_cron_add,
+        "/cron-list": handle_cron_list,
+        "/cron-remove": handle_cron_remove,
+        "/diff": handle_diff,
+        "/patch": handle_patch,
+        "/health": handle_health,
+        "/cloud-sync": handle_cloud_sync,
+        "/git-pr": handle_git_pr,
+        "/recipe-list": handle_recipe_list,
+        "/recipe-run": handle_recipe_run,
+        "/recipe-save": handle_recipe_save,
+        "/context": handle_context,
+        "/context-save": handle_context_save,
+        "/smart-install": handle_smart_install,
+        "/permission-fix": handle_permission_fix,
+        "/profile": handle_profile,
+        "/error-explain": handle_error_explain,
+        "/ssh-wizard": handle_ssh_wizard,
+        "/service-guard": handle_service_guard,
+        "/history-insight": handle_history_insight,
+        "/optimize": handle_optimize,
+        "/quick-cmd": handle_quick_cmd,
+        "/port-manage": handle_port_manage,
+        "/migrate": handle_migrate,
+        "/tutorial": handle_tutorial,
+        "/history": handle_history_list,
+        "/history-clear": handle_history_clear,
+    }
+
+
+# Cache handler map
+_HANDLER_MAP: dict | None = None
+
+
+def _get_handler_map() -> dict:
+    global _HANDLER_MAP
+    if _HANDLER_MAP is None:
+        _HANDLER_MAP = _build_handler_map()
+    return _HANDLER_MAP
+
+
+# ─── Invoke Handler In-Process ───────────────────────────────────────────
+
+def _call_handler(endpoint: str, arguments: dict) -> str:
+    """
+    Invoke a handler function in-process using a FakeHandler.
+    Returns the captured response body as a string.
+    """
+    handler_map = _get_handler_map()
+
+    # Check if endpoint has a direct handler mapping
+    if endpoint in handler_map:
+        fake = FakeHandler(method="POST", path=endpoint, body=arguments)
+        try:
+            handler_map[endpoint](fake, arguments)
+            return fake.get_body() or "(handler returned no output)"
+        except Exception as e:
+            return f"[Handler Error] {e}"
+
+    # For inline handlers in MCPHandler, we need to create an instance
+    # and call the private method. We'll create a minimal instance.
+    fake = FakeHandler(method="POST", path=endpoint, body=arguments)
+
+    # Map endpoints to MCPHandler private method names
+    inline_methods = {
+        "/run": "_handle_run",
+        "/ls": "_handle_ls",
+        "/read": "_handle_read",
+        "/write": "_handle_write",
+        "/mkdir": "_handle_mkdir",
+        "/delete": "_handle_delete",
+        "/search": "_handle_search",
+        "/cancel": None,  # special case
+        "/battery": "_handle_battery",
+        "/vibrate": "_handle_vibrate",
+        "/torch": "_handle_torch",
+        "/wallpaper": "_handle_wallpaper",
+        "/brightness": "_handle_brightness",
+        "/volume": "_handle_volume",
+        "/sensor": "_handle_sensor",
+        "/fingerprint": "_handle_fingerprint",
+        "/infrared": "_handle_infrared",
+        "/wifi-info": "_handle_wifi_info",
+        "/wifi-scan": "_handle_wifi_scan",
+        "/location": "_handle_location",
+        "/public-ip": "_handle_public_ip",
+        "/clipboard-get": "_handle_clipboard_get",
+        "/clipboard-set": "_handle_clipboard_set",
+        "/sms-send": "_handle_sms_send",
+        "/sms-inbox": "_handle_sms_inbox",
+        "/contacts": "_handle_contacts",
+        "/call": "_handle_call",
+        "/notify": "_handle_notify",
+        "/notify-remove": "_handle_notify_remove",
+        "/share": "_handle_share",
+        "/open-url": "_handle_open_url",
+        "/download": "_handle_download",
+        "/list-apps": "_handle_list_apps",
+        "/camera-photo": "_handle_camera_photo",
+        "/camera-info": "_handle_camera_info",
+        "/screenshot": "_handle_screenshot",
+        "/screen-record": "_handle_screen_record",
+        "/tts-speak": "_handle_tts_speak",
+        "/speech-to-text": "_handle_speech_to_text",
+        "/microphone-record": "_handle_microphone_record",
+        "/media-player": "_handle_media_player",
+        "/qrcode": "_handle_qrcode",
+        "/scan-barcode": "_handle_scan_barcode",
+        "/speedtest": "_handle_speedtest",
+        "/image-process": "_handle_image_process",
+        "/video-process": "_handle_video_process",
+        "/text-extract": "_handle_text_extract",
+        "/weather": "_handle_weather",
+        "/translate": "_handle_translate",
+        "/db-query": "_handle_db_query",
+        "/web-server": "_handle_web_server",
+        "/git-op": "_handle_git_op",
+        "/telephony-deviceinfo": "_handle_telephony_deviceinfo",
+        "/telephony-cellinfo": "_handle_telephony_cellinfo",
+        "/storage-get": "_handle_storage_get",
+    }
+
+    if endpoint == "/cancel":
+        from .shell import cancel_active
+        ok = cancel_active()
+        return json.dumps({"cancelled": ok})
+
+    method_name = inline_methods.get(endpoint)
+    if method_name is None:
+        return f"[Error] Unknown endpoint: {endpoint}"
+
+    # Create MCPHandler-like object by using FakeHandler as base
+    # We need to copy the method from MCPHandler onto our fake
+    from .handler import MCPHandler
+    method_fn = getattr(MCPHandler, method_name, None)
+    if method_fn is None:
+        return f"[Error] Handler method {method_name} not found"
 
     try:
-        with urllib.request.urlopen(req, timeout=130) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
-        return f"[HTTP {e.code}] {body}"
+        method_fn(fake, arguments)
+        return fake.get_body() or "(no output)"
     except Exception as e:
-        return f"[Error] {e}"
+        return f"[Handler Error] {endpoint}: {e}"
 
 
-# ─── Endpoint Mapping ────────────────────────────────────────────────────
-
-# Maps MCP tool names to (endpoint, http_method)
-# Tools not listed here will use the default pattern: /tool-name (POST)
-ENDPOINT_MAP: dict[str, tuple[str, str]] = {
-    # Shell & File
-    "shell_exec":       ("/run", "POST"),
-    "shell_cancel":     ("/cancel", "POST"),
-    "file_list":        ("/ls", "POST"),
-    "file_read":        ("/read", "POST"),
-    "file_write":       ("/write", "POST"),
-    "file_mkdir":       ("/mkdir", "POST"),
-    "file_delete":      ("/delete", "POST"),
-    "file_search":      ("/search", "POST"),
-    # Device
-    "battery_status":   ("/battery", "POST"),
-    "vibrate":          ("/vibrate", "POST"),
-    "torch":            ("/torch", "POST"),
-    "wallpaper":        ("/wallpaper", "POST"),
-    "brightness":       ("/brightness", "POST"),
-    "volume":           ("/volume", "POST"),
-    "sensor_read":      ("/sensor", "POST"),
-    "fingerprint":      ("/fingerprint", "POST"),
-    "infrared":         ("/infrared", "POST"),
-    # Network
-    "wifi_info":        ("/wifi-info", "POST"),
-    "wifi_scan":        ("/wifi-scan", "POST"),
-    "location":         ("/location", "POST"),
-    "public_ip":        ("/public-ip", "POST"),
-    # Communication
-    "clipboard_get":    ("/clipboard-get", "POST"),
-    "clipboard_set":    ("/clipboard-set", "POST"),
-    "sms_send":         ("/sms-send", "POST"),
-    "sms_inbox":        ("/sms-inbox", "POST"),
-    "contacts":         ("/contacts", "POST"),
-    "phone_call":       ("/call", "POST"),
-    "notify":           ("/notify", "POST"),
-    "notify_remove":    ("/notify-remove", "POST"),
-    "share":            ("/share", "POST"),
-    "open_url":         ("/open-url", "POST"),
-    # Media
-    "camera_photo":     ("/camera-photo", "POST"),
-    "camera_info":      ("/camera-info", "POST"),
-    "screenshot":       ("/screenshot", "POST"),
-    "screen_record":    ("/screen-record", "POST"),
-    "tts_speak":        ("/tts-speak", "POST"),
-    "speech_to_text":   ("/speech-to-text", "POST"),
-    "microphone_record":("/microphone-record", "POST"),
-    "media_player":     ("/media-player", "POST"),
-    "qrcode":           ("/qrcode", "POST"),
-    "scan_barcode":     ("/scan-barcode", "POST"),
-    # System
-    "system_info":      ("/system-info", "POST"),
-    "process_list":     ("/process-list", "POST"),
-    "process_kill":     ("/process-kill", "POST"),
-    "health":           ("/health", "POST"),
-    "env":              ("/env", "GET"),
-    "ping":             ("/ping", "GET"),
-    # Tools & Dev
-    "download":         ("/download", "POST"),
-    "list_apps":        ("/list-apps", "POST"),
-    "speedtest":        ("/speedtest", "POST"),
-    "image_process":    ("/image-process", "POST"),
-    "video_process":    ("/video-process", "POST"),
-    "text_extract":     ("/text-extract", "POST"),
-    "weather":          ("/weather", "POST"),
-    "translate":        ("/translate", "POST"),
-    "db_query":         ("/db-query", "POST"),
-    "web_server":       ("/web-server", "POST"),
-    "git_op":           ("/git-op", "POST"),
-    # Terminal Power-Tools
-    "diagnose":         ("/diagnose", "POST"),
-    "pkg_smart":        ("/pkg-smart", "POST"),
-    "explain":          ("/explain", "POST"),
-    "dev_env":          ("/dev-env", "POST"),
-    "review":           ("/review", "POST"),
-    "log_analyze":      ("/log-analyze", "POST"),
-    "script_gen":       ("/script-gen", "POST"),
-    "deps_tree":        ("/deps-tree", "POST"),
-    "storage_audit":    ("/storage-audit", "POST"),
-    "config_fix":       ("/config-fix", "POST"),
-    "git_smart":        ("/git-smart", "POST"),
-    "regex_test":       ("/regex", "POST"),
-    "db_design":        ("/db-design", "POST"),
-    "backup":           ("/backup", "POST"),
-    "restore":          ("/restore", "POST"),
-    # AI Power Features
-    "smart_install":    ("/smart-install", "POST"),
-    "permission_fix":   ("/permission-fix", "POST"),
-    "profile":          ("/profile", "POST"),
-    "error_explain":    ("/error-explain", "POST"),
-    "ssh_wizard":       ("/ssh-wizard", "POST"),
-    "service_guard":    ("/service-guard", "POST"),
-    "history_insight":  ("/history-insight", "POST"),
-    "optimize":         ("/optimize", "POST"),
-    "quick_cmd":        ("/quick-cmd", "POST"),
-    "port_manage":      ("/port-manage", "POST"),
-    "migrate":          ("/migrate", "POST"),
-    "tutorial":         ("/tutorial", "POST"),
-    # Features
-    "cron_add":         ("/cron-add", "POST"),
-    "cron_list":        ("/cron-list", "POST"),
-    "cron_remove":      ("/cron-remove", "POST"),
-    "diff_files":       ("/diff", "POST"),
-    "patch_file":       ("/patch", "POST"),
-    "cloud_sync":       ("/cloud-sync", "POST"),
-    "git_pr":           ("/git-pr", "POST"),
-    "recipe_list":      ("/recipe-list", "POST"),
-    "recipe_run":       ("/recipe-run", "POST"),
-    "recipe_save":      ("/recipe-save", "POST"),
-    "context":          ("/context", "POST"),
-    "context_save":     ("/context-save", "POST"),
-    # History
-    "history_list":     ("/history", "GET"),
-    "history_save":     ("/history", "POST"),
-    "history_clear":    ("/history-clear", "POST"),
-    # Telephony
-    "telephony_device": ("/telephony-deviceinfo", "POST"),
-    "telephony_cell":   ("/telephony-cellinfo", "POST"),
-    "storage_get":      ("/storage-get", "POST"),
-}
-
-
-# ─── MCP JSON-RPC Handler ───────────────────────────────────────────────
+# ─── MCP JSON-RPC Handlers ──────────────────────────────────────────────
 
 def _handle_initialize(params: dict) -> dict:
-    """Handle MCP initialize request."""
     return {
         "protocolVersion": "2024-11-05",
-        "capabilities": {
-            "tools": {"listChanged": False},
-        },
-        "serverInfo": {
-            "name": "termux-mcp",
-            "version": "0.7.3",
-        },
+        "capabilities": {"tools": {"listChanged": False}},
+        "serverInfo": {"name": "termux-mcp", "version": "0.7.3"},
     }
 
 
 def _handle_tools_list(params: dict) -> dict:
-    """Return all tool definitions in MCP format."""
     return {"tools": MCP_TOOLS}
 
 
 def _handle_tools_call(params: dict) -> dict:
-    """Forward tool call to the original server and return result."""
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {})
 
-    # Look up endpoint
+    # Map MCP tool name to endpoint
+    from .mcp_bridge import ENDPOINT_MAP
     if tool_name in ENDPOINT_MAP:
-        endpoint, method = ENDPOINT_MAP[tool_name]
+        endpoint, _ = ENDPOINT_MAP[tool_name]
     else:
-        # Default: convert tool_name to kebab-case endpoint
         endpoint = "/" + tool_name.replace("_", "-")
-        method = "POST"
 
-    # Call the original server
-    logger.info(f"MCP tools/call: {tool_name} → {method} {endpoint}")
-    result_text = _call_internal(endpoint, arguments, method)
+    logger.info(f"MCP tools/call: {tool_name} → {endpoint}")
+    result_text = _call_handler(endpoint, arguments)
 
     return {
-        "content": [
-            {
-                "type": "text",
-                "text": result_text if result_text else "(no output)",
-            }
-        ],
+        "content": [{"type": "text", "text": result_text}],
     }
 
 
-# ─── MCP HTTP Request Handler ────────────────────────────────────────────
+# ─── MCP HTTP Server ────────────────────────────────────────────────────
 
 class MCPBridgeHandler(BaseHTTPRequestHandler):
-    """Handles MCP protocol requests on /mcp endpoint."""
-
     protocol_version = "HTTP/1.1"
-    sessions: dict[str, dict] = {}
 
     def log_message(self, fmt, *args):
-        logger.debug("[MCP-Bridge] " + fmt, *args)
+        logger.debug("[MCP] " + fmt, *args)
 
     def _send_json(self, code: int, data: dict) -> None:
         body = json.dumps(data).encode("utf-8")
@@ -256,22 +398,20 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
 
     def _send_error(self, code: int, rpc_id, error_code: int, message: str) -> None:
         self._send_json(code, {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
+            "jsonrpc": "2.0", "id": rpc_id,
             "error": {"code": error_code, "message": message},
         })
 
     def _check_auth(self) -> bool:
         if not REQUIRE_AUTH:
             return True
-        auth = self.headers.get("X-API-Key", "") or \
-               self.headers.get("Authorization", "").removeprefix("Bearer ")
+        auth = (self.headers.get("X-API-Key", "")
+                or self.headers.get("Authorization", "").removeprefix("Bearer "))
         if auth == AUTH_TOKEN:
             return True
         self._send_json(401, {
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32000, "message": "Unauthorized: Invalid API Key"},
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32000, "message": "Unauthorized"},
         })
         return False
 
@@ -279,20 +419,20 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, MCP-Session-Id, Accept")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization, X-API-Key, MCP-Session-Id, Accept")
         self.send_header("Access-Control-Max-Age", "86400")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/mcp":
-            self._send_json(404, {"error": "Not found. Use POST /mcp"})
+        path = self.path.split("?")[0].rstrip("/")
+        if path != "/mcp":
+            self._send_json(404, {"error": "Use POST /mcp"})
             return
-
         if not self._check_auth():
             return
 
-        # Read JSON-RPC body
         try:
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode("utf-8")
@@ -305,18 +445,14 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
         method = request.get("method", "")
         params = request.get("params", {})
 
-        logger.info(f"MCP request: method={method}, id={rpc_id}")
-
-        # Route to handlers
         handlers = {
-            "initialize":              _handle_initialize,
-            "notifications/initialized": lambda p: None,  # notification, no response needed
-            "tools/list":               _handle_tools_list,
-            "tools/call":               _handle_tools_call,
+            "initialize": _handle_initialize,
+            "notifications/initialized": lambda p: None,
+            "tools/list": _handle_tools_list,
+            "tools/call": _handle_tools_call,
         }
 
         handler_fn = handlers.get(method)
-
         if handler_fn is None:
             self._send_error(200, rpc_id, -32601, f"Method not found: {method}")
             return
@@ -324,27 +460,21 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
         try:
             result = handler_fn(params)
 
-            # Notifications (no id) don't get a response
             if request.get("id") is None and method.startswith("notifications/"):
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
-            # Set session ID on initialize response
             session_id = self.headers.get("MCP-Session-Id", str(uuid4()))
+            response = {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+            body = json.dumps(response).encode("utf-8")
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("MCP-Session-Id", session_id)
             self.send_header("Access-Control-Allow-Origin", "*")
-
-            response = {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": result,
-            }
-            body = json.dumps(response).encode("utf-8")
-            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
@@ -353,19 +483,17 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
             self._send_error(200, rpc_id, -32603, f"Internal error: {e}")
 
     def do_GET(self) -> None:
-        """Handle GET /mcp (SSE stream) — return 405 for stateless mode."""
-        if self.path.rstrip("/") == "/mcp":
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/mcp":
             self._send_json(405, {
                 "jsonrpc": "2.0",
-                "error": {"code": -32000, "message": "GET /mcp not supported in stateless mode"},
+                "error": {"code": -32000, "message": "Use POST /mcp"},
                 "id": None,
             })
-        elif self.path == "/health":
+        elif path == "/health":
             self._send_json(200, {
-                "status": "ok",
-                "name": "termux-mcp",
-                "version": "0.7.3",
-                "protocol": "mcp-bridge",
+                "status": "ok", "name": "termux-mcp",
+                "version": "0.7.3", "protocol": "mcp-standalone",
             })
         else:
             self._send_json(404, {"error": "Not found"})
@@ -373,7 +501,7 @@ class MCPBridgeHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._send_json(405, {
             "jsonrpc": "2.0",
-            "error": {"code": -32000, "message": "Session management not supported in stateless mode"},
+            "error": {"code": -32000, "message": "Not supported"},
             "id": None,
         })
 
@@ -384,10 +512,8 @@ class ThreadingMCPServer(ThreadingMixIn, HTTPServer):
 
 
 def run_mcp_server(host: str = MCP_HOST, port: int = MCP_PORT) -> None:
-    """Start the MCP bridge server."""
     server = ThreadingMCPServer((host, port), MCPBridgeHandler)
-    logger.info(f"MCP Bridge listening on http://{host}:{port}/mcp")
-    logger.info(f"Internal server: http://{INTERNAL_HOST}:{INTERNAL_PORT}")
+    logger.info("MCP Bridge listening on http://%s:%d/mcp", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
