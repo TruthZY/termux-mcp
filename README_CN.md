@@ -42,8 +42,8 @@ termux_mcp/
 pkg install python git -y
 git clone -b main https://github.com/TruthZY/termux-mcp.git
 cd termux-mcp
-chmod +x start-mcp.sh
 ./start-mcp.sh
+chmod +x start-mcp.sh
 ```
 
 首次运行后，在任何 Termux 会话中输入 `mcp` 即可启动服务器。
