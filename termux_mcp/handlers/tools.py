@@ -6,17 +6,6 @@ from ..utils import error_msg, is_safe_path, shell_quote, shell_quote_num
 
 
 @register_tool(
-    name="speedtest",
-    description="Run a network speed test.",
-    schema={"type": "object", "properties": {}},
-    category="tools",
-    requires=[{"pkg": "speedtest-cli", "install": "pkg install speedtest-cli"}],
-)
-def handle_speedtest(data: dict) -> str:
-    return execute("speedtest-cli --simple 2>/dev/null || echo 'Install: pkg install speedtest-cli'")
-
-
-@register_tool(
     name="image_process",
     description="Process images: get info, resize, crop, rotate. Requires ImageMagick.",
     schema={
@@ -130,63 +119,6 @@ def handle_text_extract(data: dict) -> str:
     if not is_safe_path(input_file):
         return error_msg("Path not allowed")
     return execute(f"tesseract {shell_quote(input_file)} stdout -l {lang} 2>/dev/null || echo 'Install: pkg install tesseract'")
-
-
-@register_tool(
-    name="public_ip",
-    description="Get the device's public IP address.",
-    schema={"type": "object", "properties": {}},
-    category="tools",
-    requires=[{"pkg": "curl", "install": "pkg install curl"}],
-)
-def handle_public_ip(data: dict) -> str:
-    return execute("curl -s https://api.ipify.org 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null || echo 'No internet'")
-
-
-@register_tool(
-    name="weather",
-    description="Get current weather information for a city.",
-    schema={
-        "type": "object",
-        "properties": {"city": {"type": "string", "description": "City name (optional, uses IP geolocation if omitted)"}},
-    },
-    category="tools",
-    requires=[{"pkg": "curl", "install": "pkg install curl"}],
-)
-def handle_weather(data: dict) -> str:
-    city = data.get("city", "").strip()
-    if city:
-        return execute(f"curl -s wttr.in/{shell_quote(city)}?format=3 2>/dev/null || echo 'Install curl: pkg install curl'")
-    return execute("curl -s 'wttr.in/?format=3' 2>/dev/null || echo 'Install curl: pkg install curl'")
-
-
-@register_tool(
-    name="translate",
-    description="Translate text between languages.",
-    schema={
-        "type": "object",
-        "properties": {
-            "text": {"type": "string", "description": "Text to translate"},
-            "target_lang": {"type": "string", "description": "Target language code (default: en)"},
-            "source_lang": {"type": "string", "description": "Source language code (default: auto)"},
-        },
-        "required": ["text"],
-    },
-    category="tools",
-    requires=[{"pkg": "curl", "install": "pkg install curl"}],
-)
-def handle_translate(data: dict) -> str:
-    text = data.get("text", "").strip()
-    target = data.get("target_lang", "en").strip()
-    source = data.get("source_lang", "auto").strip()
-    if not text:
-        return error_msg("Missing 'text'")
-    return execute(
-        f"curl -s \"https://translate.googleapis.com/translate_a/single"
-        f"?client=gtx&sl={source}&tl={target}&dt=t&q={shell_quote(text)}\" "
-        f"2>/dev/null | python3 -c \"import sys,json; print(json.load(sys.stdin)[0][0][0])\" "
-        f"2>/dev/null || echo 'Translation failed'"
-    )
 
 
 @register_tool(

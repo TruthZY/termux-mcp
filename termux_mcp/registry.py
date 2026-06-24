@@ -138,6 +138,31 @@ def _check_requires(name: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Output truncation
+# ---------------------------------------------------------------------------
+
+MAX_OUTPUT_CHARS = 4000  # ~2000 tokens, configurable via env
+
+
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    """Truncate output and append guidance hint if exceeded."""
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit]
+    lines = text.split('\n')
+    omitted = len(text) - limit
+    hint = (
+        f"\n\n"
+        f"── 输出已截断（省略了 {omitted} 字符，共 {len(lines)} 行）──\n"
+        f"如需完整内容，请分步处理：\n"
+        f"  1. 用 file_read 读取保存的输出文件\n"
+        f"  2. 或用 shell_exec 加 | head / | tail / | grep 过滤关键行\n"
+        f"  3. 或传入 limit 参数减少返回量"
+    )
+    return truncated + hint
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -157,9 +182,10 @@ def call_tool(name: str, arguments: dict) -> str:
         return dep_error
 
     try:
-        return tool["handler"](arguments)
+        result = tool["handler"](arguments)
+        return _truncate(str(result)) if result else ""
     except Exception as e:
-        return f"Error executing '{name}': {e}"
+        return _truncate(f"Error executing '{name}': {e}")
 
 
 def list_categories() -> dict[str, list[str]]:
