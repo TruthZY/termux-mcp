@@ -39,6 +39,9 @@ fi
 
 cd "$TERMUX_MCP_DIR" || { err "Cannot cd to $TERMUX_MCP_DIR"; exit 1; }
 
+# ── Restore execute permission (git may strip it) ──
+chmod +x "$TERMUX_MCP_DIR/start-mcp.sh"
+
 # ── Set up alias (first time only) ──
 ALIAS_LINE="alias $ALIAS_NAME=\"$TERMUX_MCP_DIR/start-mcp.sh\""
 BASHRC="$HOME/.bashrc"
