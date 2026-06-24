@@ -42,8 +42,8 @@ Tools are registered via the `@register_tool` decorator in each handler module. 
 pkg install python git -y
 git clone -b main https://github.com/TruthZY/termux-mcp.git
 cd termux-mcp
-chmod +x start-mcp.sh
 ./start-mcp.sh
+chmod +x start-mcp.sh
 ```
 
 After the first run, just type `mcp` in any Termux session to start the server.
