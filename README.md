@@ -1,5 +1,7 @@
 # Termux-MCP
 
+[中文](README_CN.md) | English
+
 A standalone MCP (Model Context Protocol) server for Termux on Android. Exposes 88+ tools covering shell execution, file operations, device control, media, and developer utilities via the standard MCP Streamable HTTP protocol. Designed for AI agents like MiClaw, Claude Desktop, Cursor, and any MCP-compatible client.
 
 ```text
